@@ -1,0 +1,21 @@
+SHOFEER Stage 5.3B - Refund Admin Backend
+
+Copy the included files into the same paths inside the project.
+
+Then run:
+
+php artisan optimize:clear
+composer dump-autoload
+php artisan migrate
+php artisan route:list --name=admin.refunds
+php artisan test tests/Feature/Admin/RefundReviewTest.php
+php artisan test tests/Feature/Booking
+php artisan test tests/Feature/Passenger
+
+To process queued refunds locally:
+php artisan queue:work --queue=payments
+
+Expected new routes:
+GET   /admin/refunds
+PATCH /admin/refunds/{refund}/process
+PATCH /admin/refunds/{refund}/reject

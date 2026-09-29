@@ -1,0 +1,154 @@
+<?php
+
+use App\Enums\UserRole;
+use App\Http\Middleware\RoleMiddleware;
+use App\Http\Middleware\VerifiedDriver;
+use Illuminate\Foundation\Application;
+use Illuminate\Foundation\Configuration\Exceptions;
+use Illuminate\Foundation\Configuration\Middleware;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Route;
+
+return Application::configure(
+    basePath: dirname(__DIR__)
+)
+    ->withRouting(
+        /*
+         * Public / Passenger routes.
+         */
+        web: __DIR__.'/../routes/web.php',
+
+        /*
+         * Console commands.
+         */
+        commands: __DIR__.'/../routes/console.php',
+
+        /*
+         * Health endpoint.
+         */
+        health: '/up',
+
+        /*
+        |--------------------------------------------------------------------------
+        | SHOFEER Additional Routes
+        |--------------------------------------------------------------------------
+        */
+
+        then: function (): void {
+            /*
+             * Admin.
+             */
+            Route::middleware([
+                'web',
+                'auth',
+                'role:admin',
+            ])
+                ->prefix('admin')
+                ->name('admin.')
+                ->group(
+                    base_path(
+                        'routes/admin.php'
+                    )
+                );
+
+            /*
+             * Driver.
+             */
+            Route::middleware([
+                'web',
+                'auth',
+                'role:driver',
+            ])
+                ->prefix('driver')
+                ->name('driver.')
+                ->group(
+                    base_path(
+                        'routes/driver.php'
+                    )
+                );
+        },
+    )
+
+    ->withMiddleware(
+        function (
+            Middleware $middleware
+        ): void {
+            /*
+            |--------------------------------------------------------------------------
+            | Middleware Aliases
+            |--------------------------------------------------------------------------
+            */
+
+            $middleware->alias([
+                'role' => RoleMiddleware::class,
+
+                'verified.driver' => VerifiedDriver::class,
+            ]);
+            /*
+            |--------------------------------------------------------------------------
+            | Guest Redirect
+            |--------------------------------------------------------------------------
+            */
+
+            $middleware->redirectGuestsTo(
+                fn (Request $request): string => route('login')
+            );
+
+            /*
+            |--------------------------------------------------------------------------
+            | Authenticated User Redirect
+            |--------------------------------------------------------------------------
+            */
+
+            $middleware->redirectUsersTo(
+                function (
+                    Request $request
+                ): string {
+                    $user = $request->user();
+
+                    if ($user === null) {
+                        return route('home');
+                    }
+
+                    $role =
+                        $user->role instanceof UserRole
+                            ? $user->role
+                            : UserRole::tryFrom(
+                                (string) $user->role
+                            );
+
+                    return match ($role) {
+                        UserRole::Admin => route(
+                            'admin.dashboard'
+                        ),
+
+                        UserRole::Driver => route(
+                            'driver.dashboard'
+                        ),
+
+                        UserRole::Passenger => route(
+                            'dashboard'
+                        ),
+
+                        default => route('home'),
+                    };
+                }
+            );
+        }
+    )
+
+    ->withExceptions(
+        function (
+            Exceptions $exceptions
+        ): void {
+            $exceptions
+                ->shouldRenderJsonWhen(
+                    fn (
+                        Request $request
+                    ): bool => $request->is('api/*') ||
+                        $request->expectsJson()
+                );
+        }
+    )
+
+    ->create();

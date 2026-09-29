@@ -1,0 +1,2482 @@
+﻿===== BookingService.php =====
+<?php
+
+namespace App\Services;
+
+use App\Enums\BookingStatus;
+use App\Enums\PassengerGender;
+use App\Enums\PaymentReviewStatus;
+use App\Enums\PaymentStatus;
+use App\Enums\SeatStatus;
+use App\Enums\SeatType;
+use App\Models\Booking;
+use App\Models\Payment;
+use App\Models\Seat;
+use App\Models\Trip;
+use App\Models\User;
+use Illuminate\Support\Carbon;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Str;
+use Illuminate\Validation\ValidationException;
+
+class BookingService
+{
+    /*
+    |--------------------------------------------------------------------------
+    | Hold Seat
+    |--------------------------------------------------------------------------
+    */
+
+    public function holdSeat(
+        Trip $trip,
+        User $user,
+        array $data
+    ): Booking {
+        return DB::transaction(
+            function () use (
+                $trip,
+                $user,
+                $data
+            ): Booking {
+                /*
+                |--------------------------------------------------------------------------
+                | Passenger Only
+                |--------------------------------------------------------------------------
+                */
+
+                $role =
+                    $user->role instanceof \BackedEnum
+                        ? $user->role->value
+                        : (string) $user->role;
+
+                if (
+                    $role !== 'passenger'
+                ) {
+                    throw ValidationException::withMessages([
+                        'booking' => 'Ø§Ù„Ø³Ø§Ø¦Ù‚ Ø£Ùˆ Ø§Ù„Ø¥Ø¯Ø§Ø±ÙŠ Ù„Ø§ ÙŠØ³ØªØ·ÙŠØ¹ Ø§Ù„Ø­Ø¬Ø² ÙƒØ±Ø§ÙƒØ¨.',
+                    ]);
+                }
+
+                /*
+                |--------------------------------------------------------------------------
+                | Required Data
+                |--------------------------------------------------------------------------
+                */
+
+                $seatNumber =
+                    (string) $data['seat_number'];
+
+                $genderValue =
+                    $data['passenger_gender']
+                    instanceof PassengerGender
+                        ? $data['passenger_gender']->value
+                        : (string) $data['passenger_gender'];
+
+                /*
+                |--------------------------------------------------------------------------
+                | Idempotency Key
+                |--------------------------------------------------------------------------
+                */
+
+                $idempotencyKey =
+                    isset($data['idempotency_key'])
+                    && filled($data['idempotency_key'])
+                        ? (string) $data['idempotency_key']
+                        : 'booking:trip:'.
+                            $trip->id.
+                            ':user:'.
+                            $user->id.
+                            ':seat:'.
+                            $seatNumber;
+
+                /*
+                 * Ø¥Ø°Ø§ ÙƒØ§Ù† Ù†ÙØ³ Ø§Ù„Ø·Ù„Ø¨ Ù‚Ø¯ Ù†ÙÙØ° Ù…Ù† Ù‚Ø¨Ù„ØŒ
+                 * Ù†Ø¹ÙŠØ¯ Ù†ÙØ³ Ø§Ù„Ø­Ø¬Ø² ÙˆÙ„Ø§ Ù†Ù†Ø´Ø¦ Ø­Ø¬Ø²Ø§Ù‹ Ø¬Ø¯ÙŠØ¯Ø§Ù‹.
+                 */
+                $existingByIdempotency =
+                    Booking::query()
+                        ->where(
+                            'idempotency_key',
+                            $idempotencyKey
+                        )
+                        ->lockForUpdate()
+                        ->first();
+
+                if ($existingByIdempotency) {
+                    return $existingByIdempotency;
+                }
+
+                /*
+                |--------------------------------------------------------------------------
+                | Lock Trip
+                |--------------------------------------------------------------------------
+                */
+
+                $lockedTrip =
+                    Trip::query()
+                        ->whereKey(
+                            $trip->id
+                        )
+                        ->lockForUpdate()
+                        ->firstOrFail();
+
+                /*
+                |--------------------------------------------------------------------------
+                | Lock Seat
+                |--------------------------------------------------------------------------
+                */
+
+                $seat =
+                    Seat::query()
+                        ->where(
+                            'trip_id',
+                            $lockedTrip->id
+                        )
+                        ->where(
+                            'seat_number',
+                            $seatNumber
+                        )
+                        ->lockForUpdate()
+                        ->firstOrFail();
+
+                /*
+                |--------------------------------------------------------------------------
+                | Release Expired Hold
+                |--------------------------------------------------------------------------
+                */
+
+                $seatStatus =
+                    $this->enumValue(
+                        $seat->status
+                    );
+
+                if (
+                    $seatStatus
+                    === SeatStatus::Held->value
+                    && $seat->hold_expires_at
+                    && Carbon::parse(
+                        $seat->hold_expires_at
+                    )->isPast()
+                ) {
+                    Booking::query()
+                        ->where(
+                            'trip_id',
+                            $lockedTrip->id
+                        )
+                        ->where(
+                            'seat_number',
+                            $seatNumber
+                        )
+                        ->whereIn(
+                            'status',
+                            [
+                                BookingStatus::Held->value,
+                                BookingStatus::PendingPayment->value,
+                            ]
+                        )
+                        ->update([
+                            'status' => BookingStatus::Expired->value,
+
+                            'payment_status' => PaymentStatus::Failed->value,
+
+                            'cancel_reason' => 'Ø§Ù†ØªÙ‡Øª Ù…Ù‡Ù„Ø© Ø­Ø¬Ø² Ø§Ù„Ù…Ù‚Ø¹Ø¯.',
+
+                            'cancelled_at' => now(),
+
+                            'updated_at' => now(),
+                        ]);
+
+                    $seat->status =
+                        SeatStatus::Available;
+
+                    $seat->held_by_user_id =
+                        null;
+
+                    $seat->hold_expires_at =
+                        null;
+
+                    $seat->save();
+
+                    $seatStatus =
+                        SeatStatus::Available->value;
+                }
+
+                /*
+                |--------------------------------------------------------------------------
+                | Seat Must Be Available
+                |--------------------------------------------------------------------------
+                */
+
+                if (
+                    $seatStatus
+                    !== SeatStatus::Available->value
+                ) {
+                    throw ValidationException::withMessages([
+                        'seat_number' => 'Ù‡Ø°Ø§ Ø§Ù„Ù…Ù‚Ø¹Ø¯ ØºÙŠØ± Ù…ØªØ§Ø­ Ø­Ø§Ù„ÙŠØ§Ù‹.',
+                    ]);
+                }
+
+                /*
+                |--------------------------------------------------------------------------
+                | Prevent Duplicate Active Seat Booking
+                |--------------------------------------------------------------------------
+                */
+
+                $existingSeatBooking =
+                    Booking::query()
+                        ->where(
+                            'trip_id',
+                            $lockedTrip->id
+                        )
+                        ->where(
+                            'seat_number',
+                            $seatNumber
+                        )
+                        ->whereIn(
+                            'status',
+                            [
+                                BookingStatus::Held->value,
+                                BookingStatus::PendingPayment->value,
+                                BookingStatus::Confirmed->value,
+                            ]
+                        )
+                        ->lockForUpdate()
+                        ->first();
+
+                if ($existingSeatBooking) {
+                    throw ValidationException::withMessages([
+                        'seat_number' => 'ØªÙ… Ø­Ø¬Ø² Ù‡Ø°Ø§ Ø§Ù„Ù…Ù‚Ø¹Ø¯ Ø¨Ø§Ù„ÙØ¹Ù„.',
+                    ]);
+                }
+
+                /*
+                |--------------------------------------------------------------------------
+                | Female Only Seat
+                |--------------------------------------------------------------------------
+                */
+
+                $seatType =
+                    $this->enumValue(
+                        $seat->seat_type
+                    );
+
+                if (
+                    $seatType
+                    === SeatType::Female->value
+                    && $genderValue
+                    !== PassengerGender::Female->value
+                ) {
+                    throw ValidationException::withMessages([
+                        'seat_number' => 'Ù‡Ø°Ø§ Ø§Ù„Ù…Ù‚Ø¹Ø¯ Ù…Ø®ØµØµ Ù„Ù„Ù†Ø³Ø§Ø¡ ÙÙ‚Ø·.',
+                    ]);
+                }
+
+                /*
+                |--------------------------------------------------------------------------
+                | Male Beside Female
+                |--------------------------------------------------------------------------
+                */
+
+                if (
+                    $genderValue
+                    === PassengerGender::Male->value
+                    && filled(
+                        $seat->adjacent_seat_number
+                    )
+                ) {
+                    $adjacentBooking =
+                        Booking::query()
+                            ->where(
+                                'trip_id',
+                                $lockedTrip->id
+                            )
+                            ->where(
+                                'seat_number',
+                                $seat->adjacent_seat_number
+                            )
+                            ->where(
+                                'passenger_gender',
+                                PassengerGender::Female->value
+                            )
+                            ->whereIn(
+                                'status',
+                                [
+                                    BookingStatus::Held->value,
+                                    BookingStatus::PendingPayment->value,
+                                    BookingStatus::Confirmed->value,
+                                ]
+                            )
+                            ->lockForUpdate()
+                            ->first();
+
+                    if ($adjacentBooking) {
+                        $familyRelation =
+                            isset($data['family_relation'])
+                                ? (string) $data['family_relation']
+                                : null;
+
+                        $allowedRelations = [
+                            'husband',
+                            'brother',
+                            'father',
+                            'son',
+                            'paternal_uncle',
+                            'maternal_uncle',
+
+                            'Ø²ÙˆØ¬',
+                            'Ø£Ø®',
+                            'Ø§Ø¨',
+                            'Ø£Ø¨',
+                            'Ø§Ø¨Ù†',
+                            'Ø¹Ù…',
+                            'Ø®Ø§Ù„',
+                        ];
+
+                        if (
+                            ! $familyRelation
+                            || ! in_array(
+                                $familyRelation,
+                                $allowedRelations,
+                                true
+                            )
+                        ) {
+                            throw ValidationException::withMessages([
+                                'seat_number' => 'Ù„Ø§ ÙŠÙ…ÙƒÙ† Ø§Ø®ØªÙŠØ§Ø± Ù…Ù‚Ø¹Ø¯ Ø¨Ø¬Ø§Ù†Ø¨ Ø±Ø§ÙƒØ¨Ø© Ø¥Ù„Ø§ ÙÙŠ Ø­Ø§Ù„Ø© ÙˆØ¬ÙˆØ¯ ØµÙ„Ø© Ù‚Ø±Ø§Ø¨Ø© Ù…Ø³Ù…ÙˆØ­Ø©.',
+                            ]);
+                        }
+                    }
+                }
+
+                /*
+                |--------------------------------------------------------------------------
+                | Maximum Two Seats Per Trip
+                |--------------------------------------------------------------------------
+                */
+
+                $activeSeatsForUser =
+                    Booking::query()
+                        ->where(
+                            'trip_id',
+                            $lockedTrip->id
+                        )
+                        ->where(
+                            'user_id',
+                            $user->id
+                        )
+                        ->whereIn(
+                            'status',
+                            [
+                                BookingStatus::Held->value,
+                                BookingStatus::PendingPayment->value,
+                                BookingStatus::Confirmed->value,
+                            ]
+                        )
+                        ->lockForUpdate()
+                        ->count();
+
+                if (
+                    $activeSeatsForUser >= 2
+                ) {
+                    throw ValidationException::withMessages([
+                        'booking' => 'Ù„Ø§ ÙŠÙ…ÙƒÙ†Ùƒ Ø­Ø¬Ø² Ø£ÙƒØ«Ø± Ù…Ù† Ù…Ù‚Ø¹Ø¯ÙŠÙ† ÙÙŠ Ù†ÙØ³ Ø§Ù„Ø±Ø­Ù„Ø©.',
+                    ]);
+                }
+
+                /*
+                |--------------------------------------------------------------------------
+                | Maximum Five Trips Per Day
+                |--------------------------------------------------------------------------
+                */
+
+                $departureDate =
+                    Carbon::parse(
+                        $lockedTrip->departure_at
+                    )->toDateString();
+
+                $tripsForDay =
+                    Booking::query()
+                        ->where(
+                            'user_id',
+                            $user->id
+                        )
+                        ->whereIn(
+                            'status',
+                            [
+                                BookingStatus::Held->value,
+                                BookingStatus::PendingPayment->value,
+                                BookingStatus::Confirmed->value,
+                            ]
+                        )
+                        ->whereHas(
+                            'trip',
+                            function (
+                                $query
+                            ) use (
+                                $departureDate
+                            ): void {
+                                $query->whereDate(
+                                    'departure_at',
+                                    $departureDate
+                                );
+                            }
+                        )
+                        ->distinct()
+                        ->count(
+                            'trip_id'
+                        );
+
+                if (
+                    $tripsForDay >= 5
+                ) {
+                    throw ValidationException::withMessages([
+                        'booking' => 'Ù„Ø§ ÙŠÙ…ÙƒÙ†Ùƒ Ø­Ø¬Ø² Ø£ÙƒØ«Ø± Ù…Ù† Ø®Ù…Ø³ Ø±Ø­Ù„Ø§Øª ÙÙŠ Ø§Ù„ÙŠÙˆÙ… Ø§Ù„ÙˆØ§Ø­Ø¯.',
+                    ]);
+                }
+
+                /*
+                |--------------------------------------------------------------------------
+                | Create Booking
+                |--------------------------------------------------------------------------
+                */
+
+                $booking =
+                    Booking::query()
+                        ->create([
+                            'trip_id' => $lockedTrip->id,
+
+                            'user_id' => $user->id,
+
+                            'booking_code' => $this->generateBookingCode(),
+
+                            'seat_number' => $seatNumber,
+
+                            'passenger_name' => $user->name,
+
+                            'passenger_gender' => $genderValue,
+
+                            'price' => $lockedTrip->price,
+
+                            'commission' => 0,
+
+                            'paid_amount' => 0,
+
+                            'payment_status' => PaymentStatus::Unpaid,
+
+                            'status' => BookingStatus::Held,
+
+                            'idempotency_key' => $idempotencyKey,
+                        ]);
+
+                /*
+                |--------------------------------------------------------------------------
+                | Hold Seat For 15 Minutes
+                |--------------------------------------------------------------------------
+                */
+
+                $seat->status =
+                    SeatStatus::Held;
+
+                $seat->held_by_user_id =
+                    $user->id;
+
+                $seat->hold_expires_at =
+                    now()->addMinutes(15);
+
+                $seat->save();
+
+                return $booking->refresh();
+            },
+            3
+        );
+    }
+
+    /*
+    |--------------------------------------------------------------------------
+    | Cancel Unpaid Booking
+    |--------------------------------------------------------------------------
+    */
+
+    public function cancel(
+        Booking $booking,
+        User $user,
+        ?string $reason = null
+    ): Booking {
+        return DB::transaction(
+            function () use (
+                $booking,
+                $user,
+                $reason
+            ): Booking {
+                /*
+                |--------------------------------------------------------------------------
+                | Lock Booking
+                |--------------------------------------------------------------------------
+                */
+
+                $lockedBooking =
+                    Booking::query()
+                        ->whereKey(
+                            $booking->id
+                        )
+                        ->lockForUpdate()
+                        ->firstOrFail();
+
+                /*
+                |--------------------------------------------------------------------------
+                | Ownership
+                |--------------------------------------------------------------------------
+                */
+
+                if (
+                    (string) $lockedBooking->user_id
+                    !== (string) $user->id
+                ) {
+                    abort(403);
+                }
+
+                $bookingStatus =
+                    $this->enumValue(
+                        $lockedBooking->status
+                    );
+
+                /*
+                |--------------------------------------------------------------------------
+                | Idempotent Cancellation
+                |--------------------------------------------------------------------------
+                */
+
+                if (
+                    $bookingStatus
+                    === BookingStatus::Cancelled->value
+                ) {
+                    return $lockedBooking;
+                }
+
+                /*
+                |--------------------------------------------------------------------------
+                | Expired Booking
+                |--------------------------------------------------------------------------
+                */
+
+                if (
+                    $bookingStatus
+                    === BookingStatus::Expired->value
+                ) {
+                    throw ValidationException::withMessages([
+                        'booking' => 'Ù‡Ø°Ø§ Ø§Ù„Ø­Ø¬Ø² Ù…Ù†ØªÙ‡ÙŠ Ø¨Ø§Ù„ÙØ¹Ù„.',
+                    ]);
+                }
+
+                /*
+                |--------------------------------------------------------------------------
+                | Confirmed Booking
+                |--------------------------------------------------------------------------
+                |
+                | ÙŠØ­ØªØ§Ø¬ Refund Ù…Ø³ØªÙ‚Ù„ ÙˆÙ„Ø§ Ù†Ù„ØºÙŠÙ‡ Ù…Ø¨Ø§Ø´Ø±Ø©.
+                |
+                */
+
+                if (
+                    $bookingStatus
+                    === BookingStatus::Confirmed->value
+                ) {
+                    throw ValidationException::withMessages([
+                        'booking' => 'Ø§Ù„Ø­Ø¬Ø² Ù…Ø¤ÙƒØ¯ ÙˆÙ…Ø¯ÙÙˆØ¹ ÙˆÙŠØ­ØªØ§Ø¬ Ø¥Ù„Ù‰ Ø·Ù„Ø¨ Ø§Ø³ØªØ±Ø¯Ø§Ø¯ Ù…Ø§Ù„ÙŠ.',
+                    ]);
+                }
+
+                /*
+                |--------------------------------------------------------------------------
+                | Allowed Statuses
+                |--------------------------------------------------------------------------
+                */
+
+                if (
+                    ! in_array(
+                        $bookingStatus,
+                        [
+                            BookingStatus::Held->value,
+                            BookingStatus::PendingPayment->value,
+                        ],
+                        true
+                    )
+                ) {
+                    throw ValidationException::withMessages([
+                        'booking' => 'Ù„Ø§ ÙŠÙ…ÙƒÙ† Ø¥Ù„ØºØ§Ø¡ Ù‡Ø°Ø§ Ø§Ù„Ø­Ø¬Ø² ÙÙŠ Ø­Ø§Ù„ØªÙ‡ Ø§Ù„Ø­Ø§Ù„ÙŠØ©.',
+                    ]);
+                }
+
+                /*
+                |--------------------------------------------------------------------------
+                | Lock Trip
+                |--------------------------------------------------------------------------
+                */
+
+                $trip =
+                    Trip::query()
+                        ->whereKey(
+                            $lockedBooking->trip_id
+                        )
+                        ->lockForUpdate()
+                        ->firstOrFail();
+
+                if (
+                    Carbon::parse(
+                        $trip->departure_at
+                    )->isPast()
+                ) {
+                    throw ValidationException::withMessages([
+                        'booking' => 'Ù„Ø§ ÙŠÙ…ÙƒÙ† Ø¥Ù„ØºØ§Ø¡ Ø§Ù„Ø­Ø¬Ø² Ø¨Ø¹Ø¯ Ù…ÙˆØ¹Ø¯ Ø§Ù†Ø·Ù„Ø§Ù‚ Ø§Ù„Ø±Ø­Ù„Ø©.',
+                    ]);
+                }
+
+                /*
+                |--------------------------------------------------------------------------
+                | Lock Seat
+                |--------------------------------------------------------------------------
+                */
+
+                $seat =
+                    Seat::query()
+                        ->where(
+                            'trip_id',
+                            $lockedBooking->trip_id
+                        )
+                        ->where(
+                            'seat_number',
+                            $lockedBooking->seat_number
+                        )
+                        ->lockForUpdate()
+                        ->first();
+
+                /*
+                |--------------------------------------------------------------------------
+                | Lock Payment
+                |--------------------------------------------------------------------------
+                */
+
+                $payment =
+                    Payment::query()
+                        ->where(
+                            'booking_id',
+                            $lockedBooking->id
+                        )
+                        ->lockForUpdate()
+                        ->first();
+
+                /*
+                |--------------------------------------------------------------------------
+                | Reject Pending Payment
+                |--------------------------------------------------------------------------
+                */
+
+                if ($payment) {
+                    $paymentReviewStatus =
+                        $this->enumValue(
+                            $payment->status
+                        );
+
+                    if (
+                        $paymentReviewStatus
+                        === PaymentReviewStatus::Pending->value
+                    ) {
+                        $payment->status =
+                            PaymentReviewStatus::Rejected;
+
+                        $payment->rejection_reason =
+                            'Ø£Ù„ØºÙ‰ Ø§Ù„Ø±Ø§ÙƒØ¨ Ø§Ù„Ø­Ø¬Ø² Ù‚Ø¨Ù„ Ø§Ø¹ØªÙ…Ø§Ø¯ Ø§Ù„Ø¯ÙØ¹.';
+
+                        $payment->reviewed_by =
+                            null;
+
+                        $payment->reviewed_at =
+                            now();
+
+                        $payment->save();
+                    }
+                }
+
+                /*
+                |--------------------------------------------------------------------------
+                | Release Seat
+                |--------------------------------------------------------------------------
+                */
+
+                if ($seat) {
+                    $seatStatus =
+                        $this->enumValue(
+                            $seat->status
+                        );
+
+                    if (
+                        $seatStatus
+                        === SeatStatus::Held->value
+                    ) {
+                        $seat->status =
+                            SeatStatus::Available;
+
+                        $seat->held_by_user_id =
+                            null;
+
+                        $seat->hold_expires_at =
+                            null;
+
+                        $seat->save();
+                    }
+                }
+
+                /*
+                |--------------------------------------------------------------------------
+                | Booking Payment Status
+                |--------------------------------------------------------------------------
+                */
+
+                $bookingPaymentStatus =
+                    $this->enumValue(
+                        $lockedBooking->payment_status
+                    );
+
+                if (
+                    $bookingPaymentStatus
+                    === PaymentStatus::Pending->value
+                ) {
+                    $lockedBooking->payment_status =
+                        PaymentStatus::Failed;
+                }
+
+                /*
+                |--------------------------------------------------------------------------
+                | Cancel Booking
+                |--------------------------------------------------------------------------
+                */
+
+                $lockedBooking->status =
+                    BookingStatus::Cancelled;
+
+                $lockedBooking->cancel_reason =
+                    filled($reason)
+                        ? trim($reason)
+                        : 'Ø£Ù„ØºÙ‰ Ø§Ù„Ø±Ø§ÙƒØ¨ Ø§Ù„Ø­Ø¬Ø².';
+
+                $lockedBooking->cancelled_at =
+                    now();
+
+                $lockedBooking->save();
+
+                return $lockedBooking->refresh();
+            },
+            3
+        );
+    }
+
+    /*
+    |--------------------------------------------------------------------------
+    | Generate Booking Code
+    |--------------------------------------------------------------------------
+    */
+
+    private function generateBookingCode(): string
+    {
+        do {
+            $code =
+                'SHF-'.
+                Str::upper(
+                    Str::random(10)
+                );
+        } while (
+            Booking::query()
+                ->where(
+                    'booking_code',
+                    $code
+                )
+                ->exists()
+        );
+
+        return $code;
+    }
+
+    /*
+    |--------------------------------------------------------------------------
+    | Normalize Enum / String Value
+    |--------------------------------------------------------------------------
+    */
+
+    private function enumValue(
+        mixed $value
+    ): string {
+        if (
+            $value instanceof \BackedEnum
+        ) {
+            return (string) $value->value;
+        }
+
+        return (string) $value;
+    }
+}
+
+===== HoldSeatRequest.php =====
+<?php
+
+namespace App\Http\Requests\Booking;
+
+use Illuminate\Foundation\Http\FormRequest;
+use Illuminate\Validation\Rule;
+
+class HoldSeatRequest extends FormRequest
+{
+    /**
+     * Ø§Ù„Ø±Ø§ÙƒØ¨ ÙÙ‚Ø·.
+     */
+    public function authorize(): bool
+    {
+        return $this->user()?->isPassenger()
+            ?? false;
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    public function rules(): array
+    {
+        return [
+            'seat_number' => [
+                'required',
+                'integer',
+                'min:1',
+                'max:100',
+            ],
+
+            'passenger_gender' => [
+                'required',
+
+                Rule::in([
+                    'male',
+                    'female',
+                ]),
+            ],
+
+            /*
+             * ØªØ³ØªØ®Ø¯Ù… ÙÙ‚Ø· Ø¹Ù†Ø¯Ù…Ø§ ÙŠÙƒÙˆÙ† Ø±Ø¬Ù„
+             * Ø¨Ø¬ÙˆØ§Ø± Ø±Ø§ÙƒØ¨Ø© Ù…Ù† Ø£Ù‚Ø§Ø±Ø¨Ù‡.
+             */
+            'family_relation' => [
+                'nullable',
+                'string',
+
+                Rule::in([
+                    'husband',
+                    'brother',
+                    'father',
+                    'son',
+                    'paternal_uncle',
+                    'maternal_uncle',
+                ]),
+            ],
+        ];
+    }
+
+    /**
+     * @return array<string, string>
+     */
+    public function messages(): array
+    {
+        return [
+            'seat_number.required' => 'Ø§Ø®ØªØ± Ø§Ù„Ù…Ù‚Ø¹Ø¯ Ø£ÙˆÙ„Ø§Ù‹.',
+
+            'seat_number.integer' => 'Ø±Ù‚Ù… Ø§Ù„Ù…Ù‚Ø¹Ø¯ ØºÙŠØ± ØµØ§Ù„Ø­.',
+
+            'passenger_gender.required' => 'Ø­Ø¯Ø¯ Ø¬Ù†Ø³ Ø§Ù„Ø±Ø§ÙƒØ¨.',
+
+            'passenger_gender.in' => 'Ù‚ÙŠÙ…Ø© Ø§Ù„Ø¬Ù†Ø³ ØºÙŠØ± ØµØ§Ù„Ø­Ø©.',
+
+            'family_relation.in' => 'ØµÙ„Ø© Ø§Ù„Ù‚Ø±Ø§Ø¨Ø© Ø§Ù„Ù…Ø­Ø¯Ø¯Ø© ØºÙŠØ± ØµØ§Ù„Ø­Ø©.',
+        ];
+    }
+}
+
+===== PassengerGender.php =====
+<?php
+
+namespace App\Enums;
+
+enum PassengerGender: string
+{
+    case Male = 'male';
+
+    case Female = 'female';
+
+    public function label(): string
+    {
+        return match ($this) {
+            self::Male => 'Ø°ÙƒØ±',
+
+            self::Female => 'Ø£Ù†Ø«Ù‰',
+        };
+    }
+}
+
+===== BookingStatus.php =====
+<?php
+
+namespace App\Enums;
+
+enum BookingStatus: string
+{
+    case Held = 'held';
+
+    case PendingPayment = 'pending_payment';
+
+    case Confirmed = 'confirmed';
+
+    case Cancelled = 'cancelled';
+
+    case Expired = 'expired';
+
+    public function label(): string
+    {
+        return match ($this) {
+            self::Held => 'Ù…Ø­Ø¬ÙˆØ² Ù…Ø¤Ù‚ØªØ§Ù‹',
+
+            self::PendingPayment => 'Ø¨Ø§Ù†ØªØ¸Ø§Ø± Ø§Ù„Ø¯ÙØ¹',
+
+            self::Confirmed => 'Ù…Ø¤ÙƒØ¯',
+
+            self::Cancelled => 'Ù…Ù„ØºÙŠ',
+
+            self::Expired => 'Ù…Ù†ØªÙ‡ÙŠ',
+        };
+    }
+
+    public function isActive(): bool
+    {
+        return in_array(
+            $this,
+            [
+                self::Held,
+                self::PendingPayment,
+                self::Confirmed,
+            ],
+            true
+        );
+    }
+}
+
+===== PaymentStatus.php =====
+<?php
+
+namespace App\Enums;
+
+enum PaymentStatus: string
+{
+    case Unpaid = 'unpaid';
+
+    case Pending = 'pending';
+
+    case Paid = 'paid';
+
+    case Failed = 'failed';
+
+    case Refunded = 'refunded';
+
+    public function label(): string
+    {
+        return match ($this) {
+            self::Unpaid => 'ØºÙŠØ± Ù…Ø¯ÙÙˆØ¹',
+
+            self::Pending => 'Ù‚ÙŠØ¯ Ø§Ù„ØªØ­Ù‚Ù‚',
+
+            self::Paid => 'Ù…Ø¯ÙÙˆØ¹',
+
+            self::Failed => 'ÙØ´Ù„ Ø§Ù„Ø¯ÙØ¹',
+
+            self::Refunded => 'Ù…Ø³ØªØ±Ø¯',
+        };
+    }
+}
+
+===== SeatStatus.php =====
+<?php
+
+namespace App\Enums;
+
+enum SeatStatus: string
+{
+    case Available = 'available';
+
+    case Held = 'held';
+
+    case Booked = 'booked';
+
+    case Locked = 'locked';
+
+    public function label(): string
+    {
+        return match ($this) {
+            self::Available => 'Ù…ØªØ§Ø­',
+
+            self::Held => 'Ù…Ø­Ø¬ÙˆØ² Ù…Ø¤Ù‚ØªØ§Ù‹',
+
+            self::Booked => 'Ù…Ø­Ø¬ÙˆØ²',
+
+            self::Locked => 'Ù…Ù‚ÙÙ„',
+        };
+    }
+}
+
+===== SeatType.php =====
+
+===== SeatType.php =====
+<?php
+
+namespace App\Enums;
+
+enum SeatType: string
+{
+    case Standard = 'standard';
+
+    case Female = 'female';
+
+    public function label(): string
+    {
+        return match ($this) {
+            self::Standard => 'Ø¹Ø§Ø¯ÙŠ',
+
+            self::Female => 'Ù„Ù„Ù†Ø³Ø§Ø¡',
+        };
+    }
+}
+
+===== Booking.php =====
+<?php
+
+namespace App\Models;
+
+use App\Enums\BookingStatus;
+use App\Enums\PassengerGender;
+use App\Enums\PaymentStatus;
+use Illuminate\Database\Eloquent\Concerns\HasUuids;
+use Illuminate\Database\Eloquent\Factories\HasFactory;
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\BelongsTo;
+use Illuminate\Database\Eloquent\Relations\HasOne;
+
+class Booking extends Model
+{
+    use HasFactory;
+    use HasUuids;
+
+    /**
+     * @var list<string>
+     */
+    protected $fillable = [
+        'trip_id',
+        'user_id',
+        'booking_code',
+        'seat_number',
+        'passenger_name',
+        'passenger_gender',
+        'passenger_phone',
+        'passenger_phone_hash',
+        'passenger_whatsapp',
+        'passenger_id',
+        'passenger_notes',
+        'price',
+        'commission',
+        'paid_amount',
+        'payment_status',
+        'status',
+        'cancel_reason',
+        'idempotency_key',
+        'confirmed_at',
+        'cancelled_at',
+    ];
+
+    /**
+     * @var list<string>
+     */
+    protected $hidden = [
+        'passenger_phone',
+        'passenger_phone_hash',
+        'passenger_whatsapp',
+        'passenger_id',
+    ];
+
+    /**
+     * @return array<string, string>
+     */
+    protected function casts(): array
+    {
+        return [
+            'seat_number' => 'integer',
+
+            'passenger_gender' => PassengerGender::class,
+
+            'price' => 'decimal:2',
+
+            'commission' => 'decimal:2',
+
+            'paid_amount' => 'decimal:2',
+
+            'payment_status' => PaymentStatus::class,
+
+            'status' => BookingStatus::class,
+
+            'confirmed_at' => 'datetime',
+
+            'cancelled_at' => 'datetime',
+        ];
+    }
+
+    public function trip(): BelongsTo
+    {
+        return $this->belongsTo(
+            Trip::class
+        );
+    }
+
+    public function user(): BelongsTo
+    {
+        return $this->belongsTo(
+            User::class
+        );
+    }
+
+    public function payment(): HasOne
+    {
+        return $this->hasOne(
+            Payment::class
+        );
+    }
+
+    public function isActive(): bool
+    {
+        return $this->status->isActive();
+    }
+}
+
+===== Seat.php =====
+<?php
+
+namespace App\Models;
+
+use App\Enums\SeatStatus;
+use App\Enums\SeatType;
+use Illuminate\Database\Eloquent\Concerns\HasUuids;
+use Illuminate\Database\Eloquent\Factories\HasFactory;
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\BelongsTo;
+
+class Seat extends Model
+{
+    use HasFactory;
+    use HasUuids;
+
+    /**
+     * @var list<string>
+     */
+    protected $fillable = [
+        'trip_id',
+        'seat_number',
+        'seat_type',
+        'status',
+        'held_by_user_id',
+        'hold_expires_at',
+        'adjacent_seat_number',
+    ];
+
+    /**
+     * @return array<string, string>
+     */
+    protected function casts(): array
+    {
+        return [
+            'seat_number' => 'integer',
+
+            'seat_type' => SeatType::class,
+
+            'status' => SeatStatus::class,
+
+            'hold_expires_at' => 'datetime',
+
+            'adjacent_seat_number' => 'integer',
+        ];
+    }
+
+    public function trip(): BelongsTo
+    {
+        return $this->belongsTo(
+            Trip::class
+        );
+    }
+
+    public function heldBy(): BelongsTo
+    {
+        return $this->belongsTo(
+            User::class,
+            'held_by_user_id'
+        );
+    }
+
+    public function isAvailable(): bool
+    {
+        return $this->status ===
+            SeatStatus::Available;
+    }
+
+    public function isExpiredHold(): bool
+    {
+        return $this->status ===
+            SeatStatus::Held
+            && $this->hold_expires_at !== null
+            && $this->hold_expires_at->isPast();
+    }
+}
+
+===== SeatController.php =====
+<?php
+
+namespace App\Http\Controllers;
+
+use App\Enums\BookingStatus;
+use App\Enums\PassengerGender;
+use App\Enums\SeatStatus;
+use App\Enums\SeatType;
+use App\Http\Requests\Booking\HoldSeatRequest;
+use App\Models\Booking;
+use App\Models\Seat;
+use App\Models\Trip;
+use App\Services\BookingService;
+use App\Services\SeatLayoutService;
+use Illuminate\Http\RedirectResponse;
+use Illuminate\Http\Request;
+use Illuminate\Support\Collection;
+use Illuminate\View\View;
+
+class SeatController extends Controller
+{
+    /**
+     * Ø¹Ø±Ø¶ Ù…Ø®Ø·Ø· Ø§Ù„Ù…Ù‚Ø§Ø¹Ø¯.
+     */
+    public function show(
+        Request $request,
+        Trip $trip,
+        SeatLayoutService $seatLayoutService
+    ): View {
+        /*
+         * Ù„Ø§ Ù†Ø³Ù…Ø­ Ø¨Ø§Ù„Ø­Ø¬Ø² Ø¹Ù„Ù‰ Ø±Ø­Ù„Ø© ØºÙŠØ± Ù…Ù†Ø´ÙˆØ±Ø©
+         * Ø£Ùˆ ØºÙŠØ± Ù‚Ø§Ø¨Ù„Ø© Ù„Ù„Ø­Ø¬Ø².
+         */
+        abort_unless(
+            $trip->canAcceptBookings(),
+            404
+        );
+
+        $trip->load([
+            'fromCity',
+            'toCity',
+            'car',
+            'driver.user',
+        ]);
+
+        /*
+         * Ø¶Ù…Ø§Ù† ÙˆØ¬ÙˆØ¯ Ù…Ø®Ø·Ø· Ø§Ù„Ù…Ù‚Ø§Ø¹Ø¯.
+         */
+        $seatLayoutService
+            ->ensureSeatsForTrip($trip);
+
+        /*
+         * ØªÙ†Ø¸ÙŠÙ Ø£ÙŠ Holds Ø§Ù†ØªÙ‡Øª Ù…Ø¯ØªÙ‡Ø§.
+         */
+        $seatLayoutService
+            ->releaseExpiredHolds($trip);
+
+        $seats = $trip
+            ->seats()
+            ->orderBy('seat_number')
+            ->get();
+
+        /*
+         * Ø§Ù„Ø¬Ù†Ø³ Ø§Ù„Ù…Ø­Ø¯Ø¯ Ù…Ù† ÙˆØ§Ø¬Ù‡Ø© Ø§Ù„Ù…Ø³ØªØ®Ø¯Ù….
+         */
+        $gender =
+            PassengerGender::tryFrom(
+                $request
+                    ->string('gender')
+                    ->toString()
+            );
+
+        /*
+         * Ø§Ù„Ø­Ø¬ÙˆØ²Ø§Øª Ø§Ù„ÙØ¹Ø§Ù„Ø© Ù…Ù‡Ù…Ø© Ù„Ù…Ø¹Ø±ÙØ©
+         * Ø¬Ù†Ø³ Ø§Ù„Ø´Ø®Øµ ÙÙŠ Ø§Ù„Ù…Ù‚Ø¹Ø¯ Ø§Ù„Ù…Ø¬Ø§ÙˆØ±.
+         */
+        $activeBookings =
+            Booking::query()
+                ->where(
+                    'trip_id',
+                    $trip->id
+                )
+                ->whereIn(
+                    'status',
+                    [
+                        BookingStatus::Held
+                            ->value,
+
+                        BookingStatus::PendingPayment
+                            ->value,
+
+                        BookingStatus::Confirmed
+                            ->value,
+                    ]
+                )
+                ->get([
+                    'id',
+                    'user_id',
+                    'trip_id',
+                    'seat_number',
+                    'passenger_gender',
+                    'status',
+                ]);
+
+        /*
+         * Ø§Ù„Ù…Ù‚Ø§Ø¹Ø¯ Ø§Ù„ØªÙŠ ØªÙˆØ¬Ø¯ Ø¨Ø¬Ø§Ù†Ø¨ Ø±Ø§ÙƒØ¨Ø©.
+         */
+        $femaleOccupiedSeatNumbers =
+            $activeBookings
+                ->filter(
+                    fn (Booking $booking): bool => $booking
+                        ->passenger_gender ===
+                        PassengerGender::Female
+                )
+                ->pluck('seat_number')
+                ->map(
+                    fn ($number): int => (int) $number
+                )
+                ->values();
+
+        $adjacentFemaleSeatNumbers =
+            $seats
+                ->filter(
+                    function (
+                        Seat $seat
+                    ) use (
+                        $femaleOccupiedSeatNumbers
+                    ): bool {
+                        if (
+                            $seat
+                                ->adjacent_seat_number ===
+                            null
+                        ) {
+                            return false;
+                        }
+
+                        return $femaleOccupiedSeatNumbers
+                            ->contains(
+                                $seat
+                                    ->adjacent_seat_number
+                            );
+                    }
+                )
+                ->pluck('seat_number')
+                ->map(
+                    fn ($number): int => (int) $number
+                )
+                ->values()
+                ->all();
+
+        /*
+         * Ø§Ù„Ø§Ù‚ØªØ±Ø§Ø­Ø§Øª Ø§Ù„Ø«Ù„Ø§Ø«Ø©.
+         */
+        $suggestedSeatNumbers =
+            $this->suggestSeats(
+                $seats,
+                $gender,
+                $adjacentFemaleSeatNumbers
+            );
+
+        /*
+         * Ø­Ø¬ÙˆØ²Ø§Øª Ø§Ù„Ù…Ø³ØªØ®Ø¯Ù… Ø§Ù„Ù…Ø¤Ù‚ØªØ© Ø§Ù„Ø­Ø§Ù„ÙŠØ©
+         * Ù„Ù‡Ø°Ù‡ Ø§Ù„Ø±Ø­Ù„Ø©.
+         */
+        $currentHoldBookings =
+            Booking::query()
+                ->where(
+                    'trip_id',
+                    $trip->id
+                )
+                ->where(
+                    'user_id',
+                    $request->user()->id
+                )
+                ->where(
+                    'status',
+                    BookingStatus::Held->value
+                )
+                ->latest()
+                ->get();
+
+        $availableSeatsCount =
+            $seats
+                ->where(
+                    'status',
+                    SeatStatus::Available
+                )
+                ->count();
+
+        return view(
+            'trips.seats',
+            compact(
+                'trip',
+                'seats',
+                'gender',
+                'suggestedSeatNumbers',
+                'adjacentFemaleSeatNumbers',
+                'currentHoldBookings',
+                'availableSeatsCount'
+            )
+        );
+    }
+
+    /**
+     * Ø­Ø¬Ø² Ø§Ù„Ù…Ù‚Ø¹Ø¯ Ù…Ø¤Ù‚ØªØ§Ù‹.
+     */
+    public function store(
+        HoldSeatRequest $request,
+        Trip $trip,
+        BookingService $bookingService
+    ): RedirectResponse {
+        $booking =
+            $bookingService->holdSeat(
+                $trip,
+                $request->user(),
+                $request->validated()
+            );
+
+        return redirect()
+            ->route(
+                'booking.pay',
+                $booking
+            )
+            ->with(
+                'success',
+                'ØªÙ… Ø­Ø¬Ø² Ø§Ù„Ù…Ù‚Ø¹Ø¯ Ù„Ù…Ø¯Ø© 15 Ø¯Ù‚ÙŠÙ‚Ø©.'
+            );
+    }
+
+    /**
+     * Ø§Ù‚ØªØ±Ø§Ø­ Ù…Ù‚Ø§Ø¹Ø¯ Ù…Ù†Ø§Ø³Ø¨Ø©.
+     *
+     * @return array<int>
+     */
+    private function suggestSeats(
+        Collection $seats,
+        ?PassengerGender $gender,
+        array $adjacentFemaleSeatNumbers
+    ): array {
+        if ($gender === null) {
+            return [];
+        }
+
+        /*
+         * Ø§Ù„Ù…Ù‚Ø§Ø¹Ø¯ Ø§Ù„Ù…ØªØ§Ø­Ø© ÙÙ‚Ø·.
+         */
+        $available =
+            $seats->filter(
+                fn (Seat $seat): bool => $seat->status ===
+                    SeatStatus::Available
+            );
+
+        /*
+        |--------------------------------------------------------------------------
+        | Female Suggestions
+        |--------------------------------------------------------------------------
+        |
+        | Ù†Ø­Ø§ÙˆÙ„ ØªÙˆÙÙŠØ±:
+        |
+        | 1. Ù…Ù‚Ø¹Ø¯ ÙÙŠ Ù…Ù†Ø·Ù‚Ø© Ø§Ù„Ù†Ø³Ø§Ø¡.
+        | 2. Ù…Ù‚Ø¹Ø¯ Ø¨Ø¬Ø§Ù†Ø¨ Ø§Ù…Ø±Ø£Ø©.
+        | 3. Ù…Ù‚Ø¹Ø¯ Ø®Ù„ÙÙŠ.
+        |
+        */
+
+        if (
+            $gender ===
+            PassengerGender::Female
+        ) {
+            $suggestions = [];
+
+            $femaleZone =
+                $available->first(
+                    fn (Seat $seat): bool => $seat->seat_type ===
+                        SeatType::Female
+                );
+
+            if ($femaleZone !== null) {
+                $suggestions[] =
+                    $femaleZone->seat_number;
+            }
+
+            $nextToFemale =
+                $available->first(
+                    fn (Seat $seat): bool => in_array(
+                        $seat->seat_number,
+                        $adjacentFemaleSeatNumbers,
+                        true
+                    )
+                );
+
+            if ($nextToFemale !== null) {
+                $suggestions[] =
+                    $nextToFemale
+                        ->seat_number;
+            }
+
+            /*
+             * Ø§Ù„Ù…Ù‚Ø¹Ø¯ Ø§Ù„Ø®Ù„ÙÙŠ:
+             * Ø£Ø¹Ù„Ù‰ Ø±Ù‚Ù… Ù…Ù‚Ø¹Ø¯ Ù…ØªØ§Ø­.
+             */
+            $rearSeat =
+                $available
+                    ->sortByDesc(
+                        'seat_number'
+                    )
+                    ->first();
+
+            if ($rearSeat !== null) {
+                $suggestions[] =
+                    $rearSeat->seat_number;
+            }
+
+            /*
+             * Ø¥Ø°Ø§ ÙƒØ§Ù†Øª Ø§Ù„Ø§Ù‚ØªØ±Ø§Ø­Ø§Øª Ø§Ù„Ø³Ø§Ø¨Ù‚Ø©
+             * Ø£Ù‚Ù„ Ù…Ù† 3 Ù†Ù…Ù„Ø£Ù‡Ø§ Ø¨Ù…Ù‚Ø§Ø¹Ø¯ Ù…ØªØ§Ø­Ø©.
+             */
+            foreach (
+                $available as $seat
+            ) {
+                $suggestions[] =
+                    $seat->seat_number;
+
+                $suggestions =
+                    array_values(
+                        array_unique(
+                            $suggestions
+                        )
+                    );
+
+                if (
+                    count($suggestions)
+                    >= 3
+                ) {
+                    break;
+                }
+            }
+
+            return array_slice(
+                array_values(
+                    array_unique(
+                        $suggestions
+                    )
+                ),
+                0,
+                3
+            );
+        }
+
+        /*
+        |--------------------------------------------------------------------------
+        | Male Suggestions
+        |--------------------------------------------------------------------------
+        |
+        | Ù„Ù„Ø±Ø¬Ù„ Ù†Ù‚ØªØ±Ø­ ÙÙ‚Ø·:
+        |
+        | - Ù…Ù‚Ø¹Ø¯ Ø¹Ø§Ø¯ÙŠ.
+        | - Ù…ØªØ§Ø­.
+        | - Ù„ÙŠØ³ Ø¨Ø¬Ø§Ù†Ø¨ Ø±Ø§ÙƒØ¨Ø©.
+        |
+        */
+
+        return $available
+            ->filter(
+                fn (Seat $seat): bool => $seat->seat_type ===
+                        SeatType::Standard
+                    && ! in_array(
+                        $seat->seat_number,
+                        $adjacentFemaleSeatNumbers,
+                        true
+                    )
+            )
+            ->take(3)
+            ->pluck('seat_number')
+            ->map(
+                fn ($number): int => (int) $number
+            )
+            ->values()
+            ->all();
+    }
+}
+
+===== SeatSelectionTest.php =====
+<?php
+
+namespace Tests\Feature\Booking;
+
+use App\Enums\BookingStatus;
+use App\Enums\SeatStatus;
+use App\Enums\TripStatus;
+use App\Models\Booking;
+use App\Models\Car;
+use App\Models\City;
+use App\Models\Driver;
+use App\Models\Seat;
+use App\Models\Trip;
+use App\Models\User;
+use Illuminate\Foundation\Testing\RefreshDatabase;
+use Tests\TestCase;
+
+class SeatSelectionTest extends TestCase
+{
+    use RefreshDatabase;
+
+    public function test_passenger_can_view_seat_selection_page(): void
+    {
+        $trip = $this->createTrip();
+
+        $passenger =
+            User::factory()
+                ->passenger()
+                ->create();
+
+        $response = $this
+            ->actingAs($passenger)
+            ->get(
+                route(
+                    'trips.seats.show',
+                    [
+                        'trip' => $trip,
+
+                        'gender' => 'female',
+                    ]
+                )
+            );
+
+        $response
+            ->assertOk()
+            ->assertViewIs(
+                'trips.seats'
+            )
+            ->assertSee(
+                'Ø§Ø®ØªØ± Ù…Ù‚Ø¹Ø¯Ùƒ'
+            )
+            ->assertSee(
+                'Ù…Ù†Ø·Ù‚Ø© Ø§Ù„Ù†Ø³Ø§Ø¡'
+            );
+    }
+
+    public function test_passenger_can_hold_available_seat(): void
+    {
+        $trip = $this->createTrip();
+
+        $passenger =
+            User::factory()
+                ->passenger()
+                ->create();
+
+        $response = $this
+            ->actingAs($passenger)
+            ->post(
+                route(
+                    'trips.seats.store',
+                    $trip
+                ),
+                [
+                    'seat_number' => 1,
+
+                    'passenger_gender' => 'male',
+                ]
+            );
+
+        $booking =
+            Booking::query()
+                ->where(
+                    'trip_id',
+                    $trip->id
+                )
+                ->where(
+                    'user_id',
+                    $passenger->id
+                )
+                ->where(
+                    'seat_number',
+                    1
+                )
+                ->firstOrFail();
+
+        $response->assertRedirect(
+            route(
+                'booking.pay',
+                $booking
+            )
+        );
+
+        $this->assertSame(
+            BookingStatus::Held,
+            $booking->status
+        );
+
+        $seat = Seat::query()
+            ->where(
+                'trip_id',
+                $trip->id
+            )
+            ->where(
+                'seat_number',
+                1
+            )
+            ->firstOrFail();
+
+        $this->assertSame(
+            SeatStatus::Held,
+            $seat->status
+        );
+
+        $this->assertSame(
+            $passenger->id,
+            $seat->held_by_user_id
+        );
+
+        $this->assertNotNull(
+            $seat->hold_expires_at
+        );
+    }
+
+    public function test_male_cannot_hold_female_only_seat(): void
+    {
+        $trip = $this->createTrip(
+            seatCount: 8
+        );
+
+        $passenger =
+            User::factory()
+                ->passenger()
+                ->create();
+
+        $response = $this
+            ->actingAs($passenger)
+            ->post(
+                route(
+                    'trips.seats.store',
+                    $trip
+                ),
+                [
+                    /*
+                     * ÙÙŠ Ø§Ù„ØªØµÙ…ÙŠÙ… Ø§Ù„Ø§ÙØªØ±Ø§Ø¶ÙŠ
+                     * Ø¢Ø®Ø± Ù…Ù‚Ø¹Ø¯ÙŠÙ† Ù„Ù„Ù†Ø³Ø§Ø¡.
+                     */
+                    'seat_number' => 8,
+
+                    'passenger_gender' => 'male',
+                ]
+            );
+
+        $response
+            ->assertSessionHasErrors(
+                'seat_number'
+            );
+
+        $this->assertDatabaseMissing(
+            'bookings',
+            [
+                'trip_id' => $trip->id,
+
+                'user_id' => $passenger->id,
+
+                'seat_number' => 8,
+            ]
+        );
+    }
+
+    public function test_expired_hold_is_released(): void
+    {
+        $trip = $this->createTrip();
+
+        $passenger =
+            User::factory()
+                ->passenger()
+                ->create();
+
+        $this
+            ->actingAs($passenger)
+            ->post(
+                route(
+                    'trips.seats.store',
+                    $trip
+                ),
+                [
+                    'seat_number' => 1,
+
+                    'passenger_gender' => 'male',
+                ]
+            );
+
+        $booking =
+            Booking::query()
+                ->firstOrFail();
+
+        $seat = Seat::query()
+            ->where(
+                'trip_id',
+                $trip->id
+            )
+            ->where(
+                'seat_number',
+                1
+            )
+            ->firstOrFail();
+
+        $seat->update([
+            'hold_expires_at' => now()->subMinute(),
+        ]);
+
+        $response = $this
+            ->actingAs($passenger)
+            ->get(
+                route(
+                    'booking.pay',
+                    $booking
+                )
+            );
+
+        $response->assertRedirect();
+
+        $this->assertSame(
+            BookingStatus::Expired,
+            $booking
+                ->fresh()
+                ->status
+        );
+
+        $this->assertSame(
+            SeatStatus::Available,
+            $seat
+                ->fresh()
+                ->status
+        );
+
+        $this->assertNull(
+            $seat
+                ->fresh()
+                ->held_by_user_id
+        );
+    }
+
+    private function createTrip(
+        int $seatCount = 8
+    ): Trip {
+        $admin =
+            User::factory()
+                ->admin()
+                ->create();
+
+        $driverUser =
+            User::factory()
+                ->driver()
+                ->create();
+
+        $driver =
+            Driver::factory()
+                ->approved()
+                ->create([
+                    'user_id' => $driverUser->id,
+                ]);
+
+        $car =
+            Car::factory()
+                ->create([
+                    'driver_id' => $driver->id,
+
+                    'seat_count' => $seatCount,
+                ]);
+
+        $from =
+            City::factory()
+                ->create();
+
+        $to =
+            City::factory()
+                ->create();
+
+        return Trip::query()->create([
+            'driver_id' => $driver->id,
+
+            'car_id' => $car->id,
+
+            'source_trip_request_id' => null,
+
+            'from_city_id' => $from->id,
+
+            'to_city_id' => $to->id,
+
+            'departure_at' => now()->addDays(5),
+
+            'meeting_point' => 'Test Meeting Point',
+
+            'destination_point' => 'Test Destination',
+
+            'price' => 250,
+
+            'seat_count' => $seatCount,
+
+            'available_seats' => $seatCount,
+
+            'status' => TripStatus::Scheduled,
+
+            'is_published' => true,
+
+            'notes' => null,
+
+            'created_by' => $admin->id,
+        ]);
+    }
+}
+
+===== SeatRaceProtectionTest.php =====
+<?php
+
+namespace Tests\Feature\Booking;
+
+use App\Enums\TripStatus;
+use App\Models\Booking;
+use App\Models\Car;
+use App\Models\City;
+use App\Models\Driver;
+use App\Models\Seat;
+use App\Models\Trip;
+use App\Models\User;
+use Illuminate\Foundation\Testing\RefreshDatabase;
+use Tests\TestCase;
+
+class SeatRaceProtectionTest extends TestCase
+{
+    use RefreshDatabase;
+
+    public function test_second_passenger_cannot_hold_same_seat(): void
+    {
+        $trip = $this->createTrip();
+
+        $firstPassenger =
+            User::factory()
+                ->passenger()
+                ->create();
+
+        $secondPassenger =
+            User::factory()
+                ->passenger()
+                ->create();
+
+        /*
+         * Ø§Ù„Ø±Ø§ÙƒØ¨ Ø§Ù„Ø£ÙˆÙ„ ÙŠØ­Ø¬Ø² Ø§Ù„Ù…Ù‚Ø¹Ø¯.
+         */
+        $firstResponse = $this
+            ->actingAs($firstPassenger)
+            ->post(
+                route(
+                    'trips.seats.store',
+                    $trip
+                ),
+                [
+                    'seat_number' => 1,
+
+                    'passenger_gender' => 'male',
+                ]
+            );
+
+        $firstResponse
+            ->assertSessionHasNoErrors();
+
+        /*
+         * Ø±Ø§ÙƒØ¨ Ø¢Ø®Ø± ÙŠØ­Ø§ÙˆÙ„ Ù†ÙØ³ Ø§Ù„Ù…Ù‚Ø¹Ø¯.
+         */
+        $secondResponse = $this
+            ->actingAs($secondPassenger)
+            ->post(
+                route(
+                    'trips.seats.store',
+                    $trip
+                ),
+                [
+                    'seat_number' => 1,
+
+                    'passenger_gender' => 'male',
+                ]
+            );
+
+        $secondResponse
+            ->assertSessionHasErrors(
+                'seat_number'
+            );
+
+        /*
+         * ÙŠØ¬Ø¨ Ø£Ù† ÙŠØ¨Ù‚Ù‰ Ù„Ø¯ÙŠÙ†Ø§ Ø­Ø¬Ø² ÙˆØ§Ø­Ø¯ ÙÙ‚Ø·
+         * Ø¹Ù„Ù‰ Ø§Ù„Ù…Ù‚Ø¹Ø¯.
+         */
+        $this->assertSame(
+            1,
+            Booking::query()
+                ->where(
+                    'trip_id',
+                    $trip->id
+                )
+                ->where(
+                    'seat_number',
+                    1
+                )
+                ->count()
+        );
+
+        $seat = Seat::query()
+            ->where(
+                'trip_id',
+                $trip->id
+            )
+            ->where(
+                'seat_number',
+                1
+            )
+            ->firstOrFail();
+
+        $this->assertSame(
+            $firstPassenger->id,
+            $seat->held_by_user_id
+        );
+    }
+
+    public function test_repeated_same_request_is_idempotent(): void
+    {
+        $trip = $this->createTrip();
+
+        $passenger =
+            User::factory()
+                ->passenger()
+                ->create();
+
+        $payload = [
+            'seat_number' => 1,
+
+            'passenger_gender' => 'male',
+        ];
+
+        $this
+            ->actingAs($passenger)
+            ->post(
+                route(
+                    'trips.seats.store',
+                    $trip
+                ),
+                $payload
+            )
+            ->assertSessionHasNoErrors();
+
+        /*
+         * Ù†ÙØ³ Ø§Ù„Ù…Ø³ØªØ®Ø¯Ù… ÙŠØ¹ÙŠØ¯ Ù†ÙØ³ Ø§Ù„Ø·Ù„Ø¨.
+         *
+         * ÙŠØ¬Ø¨ Ø¥Ø¹Ø§Ø¯Ø© Ù†ÙØ³ Ø§Ù„Ø­Ø¬Ø² Ø¨Ø¯Ù„Ø§Ù‹
+         * Ù…Ù† Ø¥Ù†Ø´Ø§Ø¡ Ø­Ø¬Ø² Ø¬Ø¯ÙŠØ¯.
+         */
+        $this
+            ->actingAs($passenger)
+            ->post(
+                route(
+                    'trips.seats.store',
+                    $trip
+                ),
+                $payload
+            )
+            ->assertSessionHasNoErrors();
+
+        $this->assertSame(
+            1,
+            Booking::query()
+                ->where(
+                    'trip_id',
+                    $trip->id
+                )
+                ->where(
+                    'user_id',
+                    $passenger->id
+                )
+                ->where(
+                    'seat_number',
+                    1
+                )
+                ->count()
+        );
+    }
+
+    public function test_seat_layout_is_not_duplicated(): void
+    {
+        $trip = $this->createTrip(
+            seatCount: 10
+        );
+
+        $passenger =
+            User::factory()
+                ->passenger()
+                ->create();
+
+        /*
+         * ÙØªØ­ Ø§Ù„ØµÙØ­Ø© Ø£ÙƒØ«Ø± Ù…Ù† Ù…Ø±Ø©
+         * ÙŠØ³ØªØ¯Ø¹ÙŠ ensureSeatsForTrip Ø£ÙƒØ«Ø±
+         * Ù…Ù† Ù…Ø±Ø©.
+         */
+        $this
+            ->actingAs($passenger)
+            ->get(
+                route(
+                    'trips.seats.show',
+                    [
+                        'trip' => $trip,
+
+                        'gender' => 'male',
+                    ]
+                )
+            )
+            ->assertOk();
+
+        $this
+            ->actingAs($passenger)
+            ->get(
+                route(
+                    'trips.seats.show',
+                    [
+                        'trip' => $trip,
+
+                        'gender' => 'male',
+                    ]
+                )
+            )
+            ->assertOk();
+
+        $this->assertSame(
+            10,
+            Seat::query()
+                ->where(
+                    'trip_id',
+                    $trip->id
+                )
+                ->count()
+        );
+    }
+
+    private function createTrip(
+        int $seatCount = 8
+    ): Trip {
+        $admin =
+            User::factory()
+                ->admin()
+                ->create();
+
+        $driverUser =
+            User::factory()
+                ->driver()
+                ->create();
+
+        $driver =
+            Driver::factory()
+                ->approved()
+                ->create([
+                    'user_id' => $driverUser->id,
+                ]);
+
+        $car =
+            Car::factory()
+                ->create([
+                    'driver_id' => $driver->id,
+
+                    'seat_count' => $seatCount,
+                ]);
+
+        $from =
+            City::factory()
+                ->create();
+
+        $to =
+            City::factory()
+                ->create();
+
+        return Trip::query()->create([
+            'driver_id' => $driver->id,
+
+            'car_id' => $car->id,
+
+            'source_trip_request_id' => null,
+
+            'from_city_id' => $from->id,
+
+            'to_city_id' => $to->id,
+
+            'departure_at' => now()->addDays(3),
+
+            'meeting_point' => 'Meeting Point',
+
+            'destination_point' => 'Destination',
+
+            'price' => 300,
+
+            'seat_count' => $seatCount,
+
+            'available_seats' => $seatCount,
+
+            'status' => TripStatus::Scheduled,
+
+            'is_published' => true,
+
+            'notes' => null,
+
+            'created_by' => $admin->id,
+        ]);
+    }
+}
+
+===== BookingBusinessRulesTest.php =====
+<?php
+
+namespace Tests\Feature\Booking;
+
+use App\Enums\TripStatus;
+use App\Models\Car;
+use App\Models\City;
+use App\Models\Driver;
+use App\Models\Trip;
+use App\Models\User;
+use Illuminate\Foundation\Testing\RefreshDatabase;
+use Tests\TestCase;
+
+class BookingBusinessRulesTest extends TestCase
+{
+    use RefreshDatabase;
+
+    public function test_passenger_cannot_hold_more_than_two_seats_in_same_trip(): void
+    {
+        $trip = $this->createTrip(
+            seatCount: 10
+        );
+
+        $passenger =
+            User::factory()
+                ->passenger()
+                ->create();
+
+        foreach ([1, 3] as $seatNumber) {
+            $this
+                ->actingAs($passenger)
+                ->post(
+                    route(
+                        'trips.seats.store',
+                        $trip
+                    ),
+                    [
+                        'seat_number' => $seatNumber,
+
+                        'passenger_gender' => 'male',
+                    ]
+                )
+                ->assertSessionHasNoErrors();
+        }
+
+        $response = $this
+            ->actingAs($passenger)
+            ->post(
+                route(
+                    'trips.seats.store',
+                    $trip
+                ),
+                [
+                    'seat_number' => 5,
+
+                    'passenger_gender' => 'male',
+                ]
+            );
+
+        $response
+            ->assertSessionHasErrors(
+                'booking'
+            );
+
+        $this->assertSame(
+            2,
+            $passenger
+                ->bookings()
+                ->where(
+                    'trip_id',
+                    $trip->id
+                )
+                ->count()
+        );
+    }
+
+    public function test_passenger_cannot_book_more_than_five_trips_per_day(): void
+    {
+        $passenger =
+            User::factory()
+                ->passenger()
+                ->create();
+
+        /*
+         * Ø£ÙˆÙ„ Ø®Ù…Ø³ Ø±Ø­Ù„Ø§Øª Ù…Ø³Ù…ÙˆØ­Ø©.
+         */
+        for (
+            $index = 1;
+            $index <= 5;
+            $index++
+        ) {
+            $trip =
+                $this->createTrip();
+
+            $this
+                ->actingAs($passenger)
+                ->post(
+                    route(
+                        'trips.seats.store',
+                        $trip
+                    ),
+                    [
+                        'seat_number' => 1,
+
+                        'passenger_gender' => 'male',
+                    ]
+                )
+                ->assertSessionHasNoErrors();
+        }
+
+        /*
+         * Ø§Ù„Ø±Ø­Ù„Ø© Ø§Ù„Ø³Ø§Ø¯Ø³Ø© ÙŠØ¬Ø¨ Ø±ÙØ¶Ù‡Ø§.
+         */
+        $sixthTrip =
+            $this->createTrip();
+
+        $response = $this
+            ->actingAs($passenger)
+            ->post(
+                route(
+                    'trips.seats.store',
+                    $sixthTrip
+                ),
+                [
+                    'seat_number' => 1,
+
+                    'passenger_gender' => 'male',
+                ]
+            );
+
+        $response
+            ->assertSessionHasErrors(
+                'booking'
+            );
+    }
+
+    public function test_driver_cannot_book_trip_as_passenger(): void
+    {
+        $trip = $this->createTrip();
+
+        $driverUser =
+            User::factory()
+                ->driver()
+                ->create();
+
+        $response = $this
+            ->actingAs($driverUser)
+            ->post(
+                route(
+                    'trips.seats.store',
+                    $trip
+                ),
+                [
+                    'seat_number' => 1,
+
+                    'passenger_gender' => 'male',
+                ]
+            );
+
+        $response->assertForbidden();
+    }
+
+    private function createTrip(
+        int $seatCount = 8
+    ): Trip {
+        $admin =
+            User::factory()
+                ->admin()
+                ->create();
+
+        $driverUser =
+            User::factory()
+                ->driver()
+                ->create();
+
+        $driver =
+            Driver::factory()
+                ->approved()
+                ->create([
+                    'user_id' => $driverUser->id,
+                ]);
+
+        $car =
+            Car::factory()
+                ->create([
+                    'driver_id' => $driver->id,
+
+                    'seat_count' => $seatCount,
+                ]);
+
+        $from =
+            City::factory()
+                ->create();
+
+        $to =
+            City::factory()
+                ->create();
+
+        return Trip::query()->create([
+            'driver_id' => $driver->id,
+
+            'car_id' => $car->id,
+
+            'source_trip_request_id' => null,
+
+            'from_city_id' => $from->id,
+
+            'to_city_id' => $to->id,
+
+            'departure_at' => now()->addDays(7),
+
+            'meeting_point' => 'Meeting Point',
+
+            'destination_point' => 'Destination',
+
+            'price' => 250,
+
+            'seat_count' => $seatCount,
+
+            'available_seats' => $seatCount,
+
+            'status' => TripStatus::Scheduled,
+
+            'is_published' => true,
+
+            'notes' => null,
+
+            'created_by' => $admin->id,
+        ]);
+    }
+}
+
+===== ROUTE =====
+
+  POST       trips/{trip}/seats .............................................. trips.seats.store ΓÇ║ SeatController@store
+             Γçé Laravel\Boost\Middleware\InjectBoost
+             Γçé auth
+             Γçé role:passenger
+             Γçé throttle:10,1
+
+                                                                                                     Showing [1] routes
+

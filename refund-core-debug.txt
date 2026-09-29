@@ -1,0 +1,497 @@
+
+===== app\Models\Refund.php =====
+<?php
+
+namespace App\Models;
+
+use App\Enums\RefundStatus;
+use Illuminate\Database\Eloquent\Concerns\HasUuids;
+use Illuminate\Database\Eloquent\Factories\HasFactory;
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\BelongsTo;
+
+class Refund extends Model
+{
+    use HasFactory;
+    use HasUuids;
+
+    /*
+    |--------------------------------------------------------------------------
+    | Fillable
+    |--------------------------------------------------------------------------
+    */
+
+    protected $fillable = [
+        'payment_id',
+        'booking_id',
+        'requested_by',
+        'amount',
+        'reason',
+        'status',
+        'refund_idempotency_key',
+        'reviewed_by',
+        'rejection_reason',
+        'admin_reference',
+        'reviewed_at',
+        'processed_at',
+    ];
+
+    /*
+    |--------------------------------------------------------------------------
+    | Casts
+    |--------------------------------------------------------------------------
+    */
+
+    protected function casts(): array
+    {
+        return [
+            'amount' => 'decimal:2',
+
+            'status' => RefundStatus::class,
+
+            'reviewed_at' => 'datetime',
+
+            'processed_at' => 'datetime',
+        ];
+    }
+
+    /*
+    |--------------------------------------------------------------------------
+    | Payment
+    |--------------------------------------------------------------------------
+    */
+
+    public function payment(): BelongsTo
+    {
+        return $this->belongsTo(
+            Payment::class
+        );
+    }
+
+    /*
+    |--------------------------------------------------------------------------
+    | Booking
+    |--------------------------------------------------------------------------
+    */
+
+    public function booking(): BelongsTo
+    {
+        return $this->belongsTo(
+            Booking::class
+        );
+    }
+
+    /*
+    |--------------------------------------------------------------------------
+    | Requester
+    |--------------------------------------------------------------------------
+    */
+
+    public function requester(): BelongsTo
+    {
+        return $this->belongsTo(
+            User::class,
+            'requested_by'
+        );
+    }
+
+    /*
+    |--------------------------------------------------------------------------
+    | Reviewer
+    |--------------------------------------------------------------------------
+    */
+
+    public function reviewer(): BelongsTo
+    {
+        return $this->belongsTo(
+            User::class,
+            'reviewed_by'
+        );
+    }
+}
+
+===== app\Services\RefundService.php =====
+<?php
+
+namespace App\Services;
+
+use App\Enums\BookingStatus;
+use App\Enums\PaymentReviewStatus;
+use App\Enums\RefundStatus;
+use App\Models\Booking;
+use App\Models\Payment;
+use App\Models\Refund;
+use App\Models\User;
+use Illuminate\Support\Carbon;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Validation\ValidationException;
+
+class RefundService
+{
+    /*
+    |--------------------------------------------------------------------------
+    | Request Refund
+    |--------------------------------------------------------------------------
+    |
+    | هذه الدالة لا تعيد الأموال فعلياً.
+    |
+    | هي فقط تنشئ Refund Pending.
+    |
+    | تنفيذ الاسترداد الفعلي سيكون بعد موافقة الإدارة.
+    |
+    */
+
+    public function request(
+        Booking $booking,
+        User $user,
+        string $reason
+    ): Refund {
+        return DB::transaction(
+            function () use (
+                $booking,
+                $user,
+                $reason
+            ): Refund {
+                /*
+                |--------------------------------------------------------------------------
+                | Lock Booking
+                |--------------------------------------------------------------------------
+                */
+
+                $lockedBooking =
+                    Booking::query()
+                        ->whereKey(
+                            $booking->id
+                        )
+                        ->lockForUpdate()
+                        ->firstOrFail();
+
+                /*
+                |--------------------------------------------------------------------------
+                | Ownership
+                |--------------------------------------------------------------------------
+                */
+
+                if (
+                    (string) $lockedBooking->user_id
+                    !== (string) $user->id
+                ) {
+                    abort(403);
+                }
+
+                /*
+                |--------------------------------------------------------------------------
+                | Booking Status
+                |--------------------------------------------------------------------------
+                */
+
+                $bookingStatus =
+                    $lockedBooking->status
+                    instanceof \BackedEnum
+                        ? $lockedBooking
+                            ->status
+                            ->value
+                        : (string) $lockedBooking
+                            ->status;
+
+                if (
+                    $bookingStatus
+                    !== BookingStatus::Confirmed->value
+                ) {
+                    throw ValidationException::withMessages([
+                        'refund' => 'طلب الاسترداد متاح للحجوزات المؤكدة والمدفوعة فقط.',
+                    ]);
+                }
+
+                /*
+                |--------------------------------------------------------------------------
+                | Trip
+                |--------------------------------------------------------------------------
+                */
+
+                $lockedBooking->loadMissing(
+                    'trip'
+                );
+
+                if (
+                    ! $lockedBooking->trip
+                ) {
+                    throw ValidationException::withMessages([
+                        'refund' => 'لا توجد رحلة مرتبطة بهذا الحجز.',
+                    ]);
+                }
+
+                $departureAt =
+                    Carbon::parse(
+                        $lockedBooking
+                            ->trip
+                            ->departure_at
+                    );
+
+                if (
+                    $departureAt->isPast()
+                ) {
+                    throw ValidationException::withMessages([
+                        'refund' => 'لا يمكن طلب الاسترداد بعد موعد الرحلة.',
+                    ]);
+                }
+
+                /*
+                |--------------------------------------------------------------------------
+                | Lock Payment
+                |--------------------------------------------------------------------------
+                */
+
+                $payment =
+                    Payment::query()
+                        ->where(
+                            'booking_id',
+                            $lockedBooking->id
+                        )
+                        ->lockForUpdate()
+                        ->first();
+
+                if (! $payment) {
+                    throw ValidationException::withMessages([
+                        'refund' => 'لا توجد عملية دفع مرتبطة بهذا الحجز.',
+                    ]);
+                }
+
+                /*
+                |--------------------------------------------------------------------------
+                | Payment Must Be Approved
+                |--------------------------------------------------------------------------
+                */
+
+                $paymentStatus =
+                    $payment->status
+                    instanceof \BackedEnum
+                        ? $payment
+                            ->status
+                            ->value
+                        : (string) $payment
+                            ->status;
+
+                if (
+                    $paymentStatus
+                    !== PaymentReviewStatus::Approved->value
+                ) {
+                    throw ValidationException::withMessages([
+                        'refund' => 'لا يمكن طلب الاسترداد قبل اعتماد عملية الدفع.',
+                    ]);
+                }
+
+                /*
+                |--------------------------------------------------------------------------
+                | Business Idempotency
+                |--------------------------------------------------------------------------
+                |
+                | المفتاح مبني على العملية التجارية،
+                | وليس UUID عشوائياً.
+                |
+                */
+
+                $idempotencyKey =
+                    'refund:payment:'.
+                    $payment->id.
+                    ':booking:'.
+                    $lockedBooking->id.
+                    ':full:v1';
+
+                $existingRefund =
+                    Refund::query()
+                        ->where(
+                            'refund_idempotency_key',
+                            $idempotencyKey
+                        )
+                        ->lockForUpdate()
+                        ->first();
+
+                if ($existingRefund) {
+                    return $existingRefund;
+                }
+
+                /*
+                |--------------------------------------------------------------------------
+                | Pending Refund Protection
+                |--------------------------------------------------------------------------
+                */
+
+                $pendingRefund =
+                    Refund::query()
+                        ->where(
+                            'payment_id',
+                            $payment->id
+                        )
+                        ->where(
+                            'status',
+                            RefundStatus::Pending->value
+                        )
+                        ->lockForUpdate()
+                        ->first();
+
+                if ($pendingRefund) {
+                    return $pendingRefund;
+                }
+
+                /*
+                |--------------------------------------------------------------------------
+                | Prevent Over Refund
+                |--------------------------------------------------------------------------
+                |
+                | نجمع ما تم استرداده فعلياً سابقاً.
+                |
+                */
+
+                $alreadyRefunded =
+                    (float) Refund::query()
+                        ->where(
+                            'payment_id',
+                            $payment->id
+                        )
+                        ->where(
+                            'status',
+                            RefundStatus::Processed->value
+                        )
+                        ->sum(
+                            'amount'
+                        );
+
+                $paymentAmount =
+                    (float) $payment->amount;
+
+                $remainingAmount =
+                    round(
+                        $paymentAmount
+                        - $alreadyRefunded,
+                        2
+                    );
+
+                if (
+                    $remainingAmount <= 0
+                ) {
+                    throw ValidationException::withMessages([
+                        'refund' => 'تم استرداد كامل مبلغ هذه العملية بالفعل.',
+                    ]);
+                }
+
+                /*
+                |--------------------------------------------------------------------------
+                | Create Refund Request
+                |--------------------------------------------------------------------------
+                |
+                | الراكب يطلب المبلغ المتبقي بالكامل.
+                |
+                | Partial Refund سيبقى مدعوماً للنظام الإداري لاحقاً.
+                |
+                */
+
+                return Refund::query()
+                    ->create([
+                        'payment_id' => $payment->id,
+
+                        'booking_id' => $lockedBooking->id,
+
+                        'requested_by' => $user->id,
+
+                        'amount' => $remainingAmount,
+
+                        'reason' => trim($reason),
+
+                        'status' => RefundStatus::Pending,
+
+                        'refund_idempotency_key' => $idempotencyKey,
+                    ]);
+            }
+        );
+    }
+}
+
+===== app\Http\Requests\Passenger\RequestRefundRequest.php =====
+<?php
+
+namespace App\Http\Requests\Passenger;
+
+use App\Models\Booking;
+use Illuminate\Foundation\Http\FormRequest;
+
+class RequestRefundRequest extends FormRequest
+{
+    /*
+    |--------------------------------------------------------------------------
+    | Authorization
+    |--------------------------------------------------------------------------
+    */
+
+    public function authorize(): bool
+    {
+        $booking =
+            $this->route(
+                'booking'
+            );
+
+        $user =
+            $this->user();
+
+        if (
+            ! $booking instanceof Booking
+            || ! $user
+        ) {
+            return false;
+        }
+
+        /*
+         * الراكب يستطيع طلب Refund
+         * لحجزه فقط.
+         */
+        return (string) $booking->user_id
+            === (string) $user->id;
+    }
+
+    /*
+    |--------------------------------------------------------------------------
+    | Validation
+    |--------------------------------------------------------------------------
+    */
+
+    public function rules(): array
+    {
+        return [
+            'reason' => [
+                'required',
+                'string',
+                'min:5',
+                'max:1000',
+            ],
+        ];
+    }
+
+    /*
+    |--------------------------------------------------------------------------
+    | Messages
+    |--------------------------------------------------------------------------
+    */
+
+    public function messages(): array
+    {
+        return [
+            'reason.required' => 'يرجى كتابة سبب طلب الاسترداد.',
+
+            'reason.min' => 'سبب الاسترداد يجب أن يكون واضحًا.',
+
+            'reason.max' => 'سبب الاسترداد يجب ألا يتجاوز 1000 حرف.',
+        ];
+    }
+}
+
+===== app\Policies\PaymentPolicy.php =====
+FILE_NOT_FOUND
+
+===== app\Jobs\ProcessRefundJob.php =====
+FILE_NOT_FOUND
+
+===== app\Models\AuditLog.php =====
+FILE_NOT_FOUND
+
+===== MIGRATION STATUS =====
+  2026_09_29_011925_create_refunds_table ...................................................................... [2] Ran  

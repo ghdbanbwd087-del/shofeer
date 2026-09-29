@@ -7,43 +7,180 @@ use Illuminate\Support\Facades\Schema;
 return new class extends Migration
 {
     /**
-     * Run the migrations.
+     * إنشاء جداول المستخدمين والمصادقة والجلسات.
      */
     public function up(): void
     {
         Schema::create('users', function (Blueprint $table) {
-            $table->id();
-            $table->string('name');
-            $table->string('email')->unique();
-            $table->timestamp('email_verified_at')->nullable();
-            $table->string('password');
+            /*
+            |--------------------------------------------------------------------------
+            | UUID
+            |--------------------------------------------------------------------------
+            */
+
+            $table->uuid('id')->primary();
+
+            /*
+            |--------------------------------------------------------------------------
+            | Identity
+            |--------------------------------------------------------------------------
+            */
+
+            $table->string('name', 100);
+
+            $table
+                ->string('email')
+                ->nullable()
+                ->unique();
+
+            $table
+                ->string('google_id')
+                ->nullable()
+                ->unique();
+
+            /*
+             * مؤقتاً بدون PII Encryption.
+             *
+             * في المرحلة 7 سيُعاد تصميم تخزين الجوال
+             * وإضافة phone_hash وphone_version.
+             */
+            $table
+                ->string('phone', 32)
+                ->nullable()
+                ->unique();
+
+            /*
+            |--------------------------------------------------------------------------
+            | Verification
+            |--------------------------------------------------------------------------
+            */
+
+            $table
+                ->timestamp('email_verified_at')
+                ->nullable();
+
+            $table
+                ->timestamp('phone_verified_at')
+                ->nullable();
+
+            /*
+            |--------------------------------------------------------------------------
+            | Authentication
+            |--------------------------------------------------------------------------
+            */
+
+            $table
+                ->string('password')
+                ->nullable();
+
+            /*
+            |--------------------------------------------------------------------------
+            | Role
+            |--------------------------------------------------------------------------
+            */
+
+            $table
+                ->enum(
+                    'role',
+                    [
+                        'passenger',
+                        'driver',
+                        'admin',
+                    ]
+                )
+                ->default('passenger')
+                ->index();
+
+            /*
+            |--------------------------------------------------------------------------
+            | Account Status
+            |--------------------------------------------------------------------------
+            */
+
+            $table
+                ->boolean('is_active')
+                ->default(true)
+                ->index();
+
             $table->rememberToken();
+
             $table->timestamps();
         });
 
-        Schema::create('password_reset_tokens', function (Blueprint $table) {
-            $table->string('email')->primary();
-            $table->string('token');
-            $table->timestamp('created_at')->nullable();
-        });
+        /*
+        |--------------------------------------------------------------------------
+        | Password Reset
+        |--------------------------------------------------------------------------
+        */
 
-        Schema::create('sessions', function (Blueprint $table) {
-            $table->string('id')->primary();
-            $table->foreignId('user_id')->nullable()->index();
-            $table->string('ip_address', 45)->nullable();
-            $table->text('user_agent')->nullable();
-            $table->longText('payload');
-            $table->integer('last_activity')->index();
-        });
+        Schema::create(
+            'password_reset_tokens',
+            function (Blueprint $table) {
+                $table
+                    ->string('email')
+                    ->primary();
+
+                $table->string('token');
+
+                $table
+                    ->timestamp('created_at')
+                    ->nullable();
+            }
+        );
+
+        /*
+        |--------------------------------------------------------------------------
+        | Sessions
+        |--------------------------------------------------------------------------
+        */
+
+        Schema::create(
+            'sessions',
+            function (Blueprint $table) {
+                /*
+                 * Session ID ليس Domain ID.
+                 * Laravel نفسه يولده ويديره.
+                 */
+                $table
+                    ->string('id')
+                    ->primary();
+
+                /*
+                 * user_id يجب أن يطابق users.id UUID.
+                 */
+                $table
+                    ->uuid('user_id')
+                    ->nullable()
+                    ->index();
+
+                $table
+                    ->string('ip_address', 45)
+                    ->nullable();
+
+                $table
+                    ->text('user_agent')
+                    ->nullable();
+
+                $table->longText('payload');
+
+                $table
+                    ->integer('last_activity')
+                    ->index();
+            }
+        );
     }
 
     /**
-     * Reverse the migrations.
+     * حذف الجداول.
      */
     public function down(): void
     {
-        Schema::dropIfExists('users');
-        Schema::dropIfExists('password_reset_tokens');
         Schema::dropIfExists('sessions');
+
+        Schema::dropIfExists(
+            'password_reset_tokens'
+        );
+
+        Schema::dropIfExists('users');
     }
 };

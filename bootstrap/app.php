@@ -1,5 +1,6 @@
 <?php
 
+use App\Http\Controllers\Driver\DashboardController as DriverDashboardController;
 use App\Http\Middleware\RoleMiddleware;
 use App\Http\Middleware\VerifiedDriver;
 use Illuminate\Foundation\Application;
@@ -12,58 +13,103 @@ return Application::configure(
     basePath: dirname(__DIR__)
 )
     ->withRouting(
-        /*
-        |--------------------------------------------------------------------------
-        | Main Web Routes
-        |--------------------------------------------------------------------------
-        */
-
         web: __DIR__.'/../routes/web.php',
-
         commands: __DIR__.'/../routes/console.php',
-
         health: '/up',
-
-        /*
-        |--------------------------------------------------------------------------
-        | Additional Route Files
-        |--------------------------------------------------------------------------
-        */
 
         then: function (): void {
             /*
-             * admin.php يحتوي داخله بالفعل على:
-             *
-             * prefix('admin')
-             * name('admin.')
-             */
+            |--------------------------------------------------------------------------
+            | Admin Routes
+            |--------------------------------------------------------------------------
+            |
+            | routes/admin.php already contains its own /admin prefix and
+            | admin.* route-name prefix.
+            |
+            */
+
             Route::middleware('web')
                 ->group(
-                    base_path(
-                        'routes/admin.php'
-                    )
+                    base_path('routes/admin.php')
                 );
 
             /*
-             * driver.php يستخدم Routes داخلية مثل:
-             *
-             * /
-             * /register
-             * /trips
-             * /cars
-             *
-             * لذلك نعزلها تحت:
-             *
-             * /driver/*
-             * driver.*
-             */
+            |--------------------------------------------------------------------------
+            | Legacy Driver Routes
+            |--------------------------------------------------------------------------
+            |
+            | This file historically defined routes such as:
+            |
+            | /register
+            | /cars
+            | /request-trip
+            | /trips
+            |
+            | and names such as:
+            |
+            | register.store
+            | cars.store
+            | request-trip.store
+            | trips.index
+            |
+            | Driver feature tests and SHOFEER's intended URL structure expect:
+            |
+            | /driver/register
+            | /driver/cars
+            | /driver/request-trip
+            | /driver/trips
+            |
+            | with names:
+            |
+            | driver.register.store
+            | driver.cars.store
+            | driver.request-trip.store
+            | driver.trips.index
+            |
+            | Therefore the entire legacy file is isolated under /driver and
+            | driver.* here. This also prevents it from overriding public /
+            | home, /register, /trips and other passenger/public routes.
+            |
+            */
+
             Route::middleware('web')
                 ->prefix('driver')
                 ->name('driver.')
                 ->group(
-                    base_path(
-                        'routes/driver.php'
-                    )
+                    base_path('routes/driver.php')
+                );
+
+            /*
+            |--------------------------------------------------------------------------
+            | Canonical Driver Dashboard
+            |--------------------------------------------------------------------------
+            |
+            | routes/driver.php contains the historical driver dashboard.
+            | Register the Stage 5.9 dashboard last so driver.dashboard always
+            | resolves to the real Blade dashboard controller.
+            |
+            */
+
+            Route::middleware([
+                'web',
+                'auth',
+                'role:driver',
+                'verified.driver',
+            ])
+                ->prefix('driver')
+                ->name('driver.')
+                ->group(
+                    function (): void {
+                        Route::get(
+                            '/',
+                            [
+                                DriverDashboardController::class,
+                                'index',
+                            ]
+                        )->name(
+                            'dashboard'
+                        );
+                    }
                 );
         }
     )
@@ -71,95 +117,22 @@ return Application::configure(
         function (
             Middleware $middleware
         ): void {
-            /*
-            |--------------------------------------------------------------------------
-            | Middleware Aliases
-            |--------------------------------------------------------------------------
-            */
-
             $middleware->alias([
-                'role' => RoleMiddleware::class,
+                'role' =>
+                    RoleMiddleware::class,
 
-                'verified.driver' => VerifiedDriver::class,
+                'verified.driver' =>
+                    VerifiedDriver::class,
             ]);
-
-            /*
-            |--------------------------------------------------------------------------
-            | Guest Redirect
-            |--------------------------------------------------------------------------
-            |
-            | المستخدم غير المسجل الذي يدخل Route محمية
-            | يعود إلى صفحة تسجيل الدخول.
-            |
-            */
-
-            $middleware->redirectGuestsTo(
-                fn (Request $request): string => route('login')
-            );
-
-            /*
-            |--------------------------------------------------------------------------
-            | Authenticated User Redirect
-            |--------------------------------------------------------------------------
-            |
-            | middleware: guest
-            |
-            | Passenger -> dashboard
-            | Driver    -> driver.dashboard
-            | Admin     -> admin.dashboard
-            |
-            */
-
-            $middleware->redirectUsersTo(
-                function (
-                    Request $request
-                ): string {
-                    $user = $request->user();
-
-                    if (! $user) {
-                        return route('home');
-                    }
-
-                    /*
-                     * role قد تكون Backed Enum
-                     * أو string، لذلك ندعم الحالتين.
-                     */
-                    $role = $user->role;
-
-                    $roleValue =
-                        $role instanceof BackedEnum
-                            ? $role->value
-                            : (string) $role;
-
-                    return match ($roleValue) {
-                        'admin' => route(
-                            'admin.dashboard'
-                        ),
-
-                        'driver' => route(
-                            'driver.dashboard'
-                        ),
-
-                        default => route(
-                            'dashboard'
-                        ),
-                    };
-                }
-            );
         }
     )
     ->withExceptions(
         function (
             Exceptions $exceptions
         ): void {
-            /*
-            |--------------------------------------------------------------------------
-            | JSON Exceptions
-            |--------------------------------------------------------------------------
-            */
-
             $exceptions->shouldRenderJsonWhen(
-                fn (Request $request) => $request->is('api/*')
+                fn (Request $request) =>
+                    $request->is('api/*')
                     || $request->expectsJson()
             );
         }

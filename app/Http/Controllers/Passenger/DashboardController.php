@@ -9,6 +9,7 @@ use App\Http\Requests\Passenger\RequestRefundRequest;
 use App\Models\Booking;
 use App\Models\Refund;
 use App\Services\BookingService;
+use App\Services\NotificationService;
 use App\Services\RefundService;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Http\RedirectResponse;
@@ -18,24 +19,13 @@ use Illuminate\View\View;
 
 class DashboardController extends Controller
 {
-    /*
-    |--------------------------------------------------------------------------
-    | Constructor
-    |--------------------------------------------------------------------------
-    */
-
     public function __construct(
         private readonly BookingService $bookingService,
-        private readonly RefundService $refundService
+        private readonly RefundService $refundService,
+        private readonly NotificationService $notificationService
     ) {
         //
     }
-
-    /*
-    |--------------------------------------------------------------------------
-    | Passenger Dashboard
-    |--------------------------------------------------------------------------
-    */
 
     public function index(
         Request $request
@@ -50,78 +40,71 @@ class DashboardController extends Controller
                     $user->id
                 );
 
-        /*
-        |--------------------------------------------------------------------------
-        | Statistics
-        |--------------------------------------------------------------------------
-        */
-
         $stats = [
-            'total_bookings' => (clone $baseQuery)
-                ->count(),
-
-            'upcoming_bookings' => (clone $baseQuery)
-                ->whereIn(
-                    'status',
-                    [
-                        BookingStatus::Held->value,
-                        BookingStatus::PendingPayment->value,
-                        BookingStatus::Confirmed->value,
-                    ]
-                )
-                ->whereHas(
-                    'trip',
-                    function (
-                        Builder $query
-                    ): void {
-                        $query->where(
-                            'departure_at',
-                            '>=',
-                            now()
-                        );
-                    }
-                )
-                ->count(),
-
-            'pending_payments' => (clone $baseQuery)
-                ->where(
-                    'status',
-                    BookingStatus::PendingPayment->value
-                )
-                ->count(),
-
-            'completed_trips' => (clone $baseQuery)
-                ->where(
-                    'status',
-                    BookingStatus::Confirmed->value
-                )
-                ->whereHas(
-                    'trip',
-                    function (
-                        Builder $query
-                    ): void {
-                        $query->where(
-                            'departure_at',
-                            '<',
-                            now()
-                        );
-                    }
-                )
-                ->count(),
-
-            'total_paid' => (float) (
+            'total_bookings' =>
                 (clone $baseQuery)
-                    ->sum(
-                        'paid_amount'
-                    )
-            ),
-        ];
+                    ->count(),
 
-        /*
-        |--------------------------------------------------------------------------
-        | Upcoming Bookings
-        |--------------------------------------------------------------------------
-        */
+            'upcoming_bookings' =>
+                (clone $baseQuery)
+                    ->whereIn(
+                        'status',
+                        [
+                            BookingStatus::Held->value,
+                            BookingStatus::PendingPayment->value,
+                            BookingStatus::Confirmed->value,
+                        ]
+                    )
+                    ->whereHas(
+                        'trip',
+                        function (
+                            Builder $query
+                        ): void {
+                            $query->where(
+                                'departure_at',
+                                '>=',
+                                now()
+                            );
+                        }
+                    )
+                    ->count(),
+
+            'pending_payments' =>
+                (clone $baseQuery)
+                    ->where(
+                        'status',
+                        BookingStatus::PendingPayment->value
+                    )
+                    ->count(),
+
+            'completed_trips' =>
+                (clone $baseQuery)
+                    ->where(
+                        'status',
+                        BookingStatus::Confirmed->value
+                    )
+                    ->whereHas(
+                        'trip',
+                        function (
+                            Builder $query
+                        ): void {
+                            $query->where(
+                                'departure_at',
+                                '<',
+                                now()
+                            );
+                        }
+                    )
+                    ->count(),
+
+            'total_paid' =>
+                (float) (
+                    (clone $baseQuery)
+                        ->sum(
+                            'paid_amount'
+                        )
+                ),
+        ];
 
         $upcomingBookings =
             Booking::query()
@@ -156,23 +139,41 @@ class DashboardController extends Controller
                 ->limit(5)
                 ->get();
 
+        $latestNotifications =
+            $this
+                ->notificationService
+                ->latestForUser(
+                    user: $user,
+                    limit: 5
+                );
+
+        $unreadNotificationsCount =
+            $this
+                ->notificationService
+                ->unreadCount(
+                    $user
+                );
+
         return view(
             'passenger.dashboard.index',
             [
-                'user' => $user,
+                'user' =>
+                    $user,
 
-                'stats' => $stats,
+                'stats' =>
+                    $stats,
 
-                'upcomingBookings' => $upcomingBookings,
+                'upcomingBookings' =>
+                    $upcomingBookings,
+
+                'latestNotifications' =>
+                    $latestNotifications,
+
+                'unreadNotificationsCount' =>
+                    $unreadNotificationsCount,
             ]
         );
     }
-
-    /*
-    |--------------------------------------------------------------------------
-    | My Bookings
-    |--------------------------------------------------------------------------
-    */
 
     public function bookings(
         Request $request
@@ -210,12 +211,6 @@ class DashboardController extends Controller
                     'trip',
                 ]);
 
-        /*
-        |--------------------------------------------------------------------------
-        | Upcoming
-        |--------------------------------------------------------------------------
-        */
-
         if (
             $tab === 'upcoming'
         ) {
@@ -242,12 +237,6 @@ class DashboardController extends Controller
                 );
         }
 
-        /*
-        |--------------------------------------------------------------------------
-        | Past
-        |--------------------------------------------------------------------------
-        */
-
         if (
             $tab === 'past'
         ) {
@@ -270,12 +259,6 @@ class DashboardController extends Controller
                 );
         }
 
-        /*
-        |--------------------------------------------------------------------------
-        | Cancelled
-        |--------------------------------------------------------------------------
-        */
-
         if (
             $tab === 'cancelled'
         ) {
@@ -288,12 +271,6 @@ class DashboardController extends Controller
             );
         }
 
-        /*
-        |--------------------------------------------------------------------------
-        | Pagination
-        |--------------------------------------------------------------------------
-        */
-
         $bookings =
             $query
                 ->latest()
@@ -303,47 +280,32 @@ class DashboardController extends Controller
         return view(
             'passenger.bookings.index',
             [
-                'user' => $user,
+                'user' =>
+                    $user,
 
-                'bookings' => $bookings,
+                'bookings' =>
+                    $bookings,
 
-                'tab' => $tab,
+                'tab' =>
+                    $tab,
             ]
         );
     }
-
-    /*
-    |--------------------------------------------------------------------------
-    | Booking Details
-    |--------------------------------------------------------------------------
-    */
 
     public function show(
         Request $request,
         Booking $booking
     ): View {
-        /*
-         * Booking ownership / policy.
-         */
         Gate::authorize(
             'view',
             $booking
         );
 
-        /*
-         * Existing relations only.
-         *
-         * لا نحتاج تعديل Booking Model
-         * لإضافة refunds relation.
-         */
         $booking->load([
             'trip',
             'payment',
         ]);
 
-        /*
-         * آخر طلب Refund للحجز.
-         */
         $latestRefund =
             Refund::query()
                 ->where(
@@ -356,20 +318,17 @@ class DashboardController extends Controller
         return view(
             'passenger.bookings.show',
             [
-                'user' => $request->user(),
+                'user' =>
+                    $request->user(),
 
-                'booking' => $booking,
+                'booking' =>
+                    $booking,
 
-                'latestRefund' => $latestRefund,
+                'latestRefund' =>
+                    $latestRefund,
             ]
         );
     }
-
-    /*
-    |--------------------------------------------------------------------------
-    | Cancel Unpaid Booking
-    |--------------------------------------------------------------------------
-    */
 
     public function cancel(
         CancelBookingRequest $request,
@@ -380,9 +339,7 @@ class DashboardController extends Controller
                 ->bookingService
                 ->cancel(
                     booking: $booking,
-
                     user: $request->user(),
-
                     reason: $request->validated(
                         'cancel_reason'
                     )
@@ -399,12 +356,6 @@ class DashboardController extends Controller
             );
     }
 
-    /*
-    |--------------------------------------------------------------------------
-    | Request Refund
-    |--------------------------------------------------------------------------
-    */
-
     public function requestRefund(
         RequestRefundRequest $request,
         Booking $booking
@@ -414,20 +365,12 @@ class DashboardController extends Controller
                 ->refundService
                 ->request(
                     booking: $booking,
-
                     user: $request->user(),
-
                     reason: $request->validated(
                         'reason'
                     )
                 );
 
-        /*
-         * wasRecentlyCreated:
-         *
-         * true  = طلب جديد
-         * false = الطلب موجود مسبقاً
-         */
         $message =
             $refund->wasRecentlyCreated
                 ? 'تم إرسال طلب الاسترداد للإدارة بنجاح.'

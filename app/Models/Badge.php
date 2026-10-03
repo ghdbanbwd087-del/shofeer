@@ -2,11 +2,11 @@
 
 namespace App\Models;
 
+use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Concerns\HasUuids;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\HasMany;
-use Illuminate\Database\Eloquent\Builder;
 
 class Badge extends Model
 {
@@ -18,6 +18,7 @@ class Badge extends Model
         'name',
         'description',
         'icon',
+        'audience',
         'min_completed_trips',
         'benefits',
         'sort_order',
@@ -36,11 +37,27 @@ class Badge extends Model
 
     public function userBadges(): HasMany
     {
-        return $this->hasMany(UserBadge::class);
+        return $this->hasMany(
+            UserBadge::class
+        );
     }
 
-    public function scopeActive(Builder $query): Builder
-    {
-        return $query->where('is_active', true);
+    public function scopeActive(
+        Builder $query
+    ): Builder {
+        return $query->where(
+            'is_active',
+            true
+        );
+    }
+
+    public function scopeForAudience(
+        Builder $query,
+        string $audience
+    ): Builder {
+        return $query->where(
+            'audience',
+            $audience
+        );
     }
 }

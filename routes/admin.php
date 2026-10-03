@@ -1,21 +1,19 @@
 <?php
 
 use App\Http\Controllers\Admin\CarController;
+use App\Http\Controllers\Admin\DashboardController;
 use App\Http\Controllers\Admin\DriverController;
+use App\Http\Controllers\Admin\DriverReviewController;
+use App\Http\Controllers\Admin\LiveController;
+use App\Http\Controllers\Admin\NotificationController;
 use App\Http\Controllers\Admin\PackageController;
 use App\Http\Controllers\Admin\PaymentController;
 use App\Http\Controllers\Admin\RefundController;
 use App\Http\Controllers\Admin\RewardController;
 use App\Http\Controllers\Admin\TripController;
 use App\Http\Controllers\Admin\TripRequestController;
-use Illuminate\Http\Request;
+use App\Http\Controllers\Admin\UserController;
 use Illuminate\Support\Facades\Route;
-
-/*
-|--------------------------------------------------------------------------
-| SHOFEER Admin Routes
-|--------------------------------------------------------------------------
-*/
 
 Route::middleware([
     'auth',
@@ -27,31 +25,44 @@ Route::middleware([
         function (): void {
             Route::get(
                 '/',
-                function (
-                    Request $request
-                ) {
-                    return response()->json([
-                        'message' => 'SHOFEER admin area is ready.',
-
-                        'user' => [
-                            'id' => $request
-                                ->user()
-                                ->id,
-
-                            'name' => $request
-                                ->user()
-                                ->name,
-
-                            'role' => $request
-                                ->user()
-                                ->role
-                                ->value,
-                        ],
-                    ]);
-                }
+                [
+                    DashboardController::class,
+                    'index',
+                ]
             )->name(
                 'dashboard'
             );
+
+
+            /*
+            |--------------------------------------------------------------------------
+            | Users
+            |--------------------------------------------------------------------------
+            */
+
+            Route::get(
+                '/users',
+                [
+                    UserController::class,
+                    'index',
+                ]
+            )->name(
+                'users.index'
+            );
+
+            Route::patch(
+                '/users/{user}/status',
+                [
+                    UserController::class,
+                    'updateStatus',
+                ]
+            )
+                ->middleware(
+                    'throttle:20,1'
+                )
+                ->name(
+                    'users.status.update'
+                );
 
             /*
             |--------------------------------------------------------------------------
@@ -62,7 +73,7 @@ Route::middleware([
             Route::get(
                 '/drivers',
                 [
-                    DriverController::class,
+                    DriverReviewController::class,
                     'index',
                 ]
             )->name(
@@ -369,6 +380,66 @@ Route::middleware([
                 )
                 ->name(
                     'packages.status'
+                );
+
+            /*
+            |--------------------------------------------------------------------------
+            | Live Map
+            |--------------------------------------------------------------------------
+            */
+
+            Route::get(
+                '/live',
+                [
+                    LiveController::class,
+                    'index',
+                ]
+            )->name(
+                'live.index'
+            );
+
+            Route::get(
+                '/live/data',
+                [
+                    LiveController::class,
+                    'data',
+                ]
+            )
+                ->middleware(
+                    'throttle:60,1'
+                )
+                ->name(
+                    'live.data'
+                );
+
+            /*
+            |--------------------------------------------------------------------------
+            | Notifications
+            |--------------------------------------------------------------------------
+            */
+
+            Route::get(
+                '/notifications',
+                [
+                    NotificationController::class,
+                    'index',
+                ]
+            )->name(
+                'notifications.index'
+            );
+
+            Route::post(
+                '/notifications',
+                [
+                    NotificationController::class,
+                    'store',
+                ]
+            )
+                ->middleware(
+                    'throttle:10,1'
+                )
+                ->name(
+                    'notifications.store'
                 );
 
             /*
